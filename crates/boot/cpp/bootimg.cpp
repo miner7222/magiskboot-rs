@@ -743,7 +743,7 @@ void repack(Utf8CStr src_img, Utf8CStr out_img, bool skip_comp) {
      ***************/
 
     // Create new image
-    int fd = open(out_img.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    int fd = xopen(out_img.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
 
     // Copy non-standard headers
     if (boot.flags[DHTB_FLAG]) {
