@@ -1,0 +1,40 @@
+[package]
+name = "magiskboot"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "magiskboot"
+path = "src/main.rs"
+
+[build-dependencies]
+pb-rs = "0.10"
+cc = "1"
+
+[dependencies]
+base = { path = "../base" }
+# cxx dependency removed — using cc + extern "C" wrapper instead
+# Compression
+flate2 = { version = "1", features = ["zlib-rs"] }
+bzip2 = "0.5"
+lz4 = "1"
+lzma-rust2 = "0.16"
+zopfli = { version = "0.8", features = ["gzip"] }
+# Crypto — use 0.10 series for digest compatibility
+sha1 = "0.10"
+sha2 = "0.10"
+digest = { version = "0.10", features = ["std"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+# p521 disabled: 0.13 lacks pkcs8/spki TryFrom support needed for signing/verifying
+# p521 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+rsa = { version = "0.9", features = ["sha2"] }
+x509-cert = "0.2"
+der = { version = "0.7", features = ["derive", "pem"] }
+# Parsing
+fdt = "0.1.5"
+size = "0.5.0"
+quick-protobuf = "0.8"
+byteorder = "1"
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+num-traits = "0.2"

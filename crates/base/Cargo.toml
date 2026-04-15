@@ -1,0 +1,10 @@
+[package]
+name = "base"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+derive = { path = "../derive" }
+thiserror = "2"
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+memmap2 = "0.9"
