@@ -19,7 +19,7 @@ use crate::ffi::FileFormat;
 use crate::patch::{patch_encryption, patch_verity};
 use crate::compat::libc_compat::{
     S_IFBLK, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP,
-    S_IWOTH, S_IWUSR, S_IXGRP, S_IXOTH, S_IXUSR, dev_t, gid_t, makedev,
+    S_IWOTH, S_IWUSR, S_IXGRP, S_IXOTH, S_IXUSR, dev_t, gid_t, makedev, mknod,
     mode_t, uid_t,
 };
 use base::{
@@ -411,8 +411,8 @@ impl Cpio {
                 mode,
                 uid: 0,
                 gid: 0,
-                rdevmajor,
-                rdevminor,
+                rdevmajor: 0,
+                rdevminor: 0,
                 data: content,
             }),
         );
