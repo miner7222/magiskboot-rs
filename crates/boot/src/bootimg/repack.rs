@@ -178,20 +178,19 @@ fn repack_v3(
     new_hdr.ramdisk_size = new_ramdisk_size as u32;
     pad_to(&mut out, out_hdr_off, PAGE);
 
-    // 5. Tail (AVB / appended data) verbatim from source.
+    // 5. Tail (AVB / appended data) verbatim from source. Must be
+    //    the last write — any subsequent zero-pad would push the
+    //    AVB2 footer (last 64 bytes of the source tail) away from
+    //    EOF, which breaks downstream `avbtool erase_footer` calls
+    //    (they look at the final 64 bytes for `AVBf` magic).
     if src_tail_off_abs < src.len() {
         out.extend_from_slice(&src[src_tail_off_abs..]);
     }
 
-    // 6. Pad or truncate to source length for wrappers that encode
-    //    a fixed payload size (Chromeos / DHTB / Blob). Upstream also
-    //    does this pad step unconditionally except for chromeos.
-    pad_to_source_length(&mut out, src.len());
-
-    // 7. Patch header in place with the rewritten sizes.
+    // 6. Patch header in place with the rewritten sizes.
     patch_v3_header(&mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV3>()], &new_hdr);
 
-    // 8. Patch outer wrapper size fields.
+    // 7. Patch outer wrapper size fields.
     patch_outer_wrapper(&mut out, out_hdr_off, src_tail_off_rel);
 
     write_file(out_img, &out)
@@ -277,11 +276,12 @@ fn repack_v4(
         pad_to(&mut out, out_hdr_off, PAGE);
     }
 
-    // Tail verbatim.
+    // Tail verbatim — must be the last write so the AVB2 footer
+    // (last 64 bytes of source tail) stays at EOF for downstream
+    // `avbtool erase_footer` to find.
     if src_tail_off_abs < src.len() {
         out.extend_from_slice(&src[src_tail_off_abs..]);
     }
-    pad_to_source_length(&mut out, src.len());
 
     patch_v4_header(&mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV4>()], &new_hdr);
 
@@ -412,15 +412,6 @@ fn pad_to(out: &mut Vec<u8>, hdr_off: usize, page: usize) {
     let rel = out.len() - hdr_off;
     let pad = align_padding(rel as u64, page as u64) as usize;
     out.resize(out.len() + pad, 0);
-}
-
-/// Pad with zeros (not truncate) so the output is at least as long
-/// as the source. Shorter outputs grow; longer outputs are kept
-/// (the appended tail already went in unchanged).
-fn pad_to_source_length(out: &mut Vec<u8>, src_len: usize) {
-    if out.len() < src_len {
-        out.resize(src_len, 0);
-    }
 }
 
 fn patch_v3_header(slot: &mut [u8], hdr: &BootImgHdrV3) {
