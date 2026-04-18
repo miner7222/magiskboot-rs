@@ -18,6 +18,7 @@ pub mod argh {
 pub mod ffi;
 pub mod extern_c;
 
+pub mod bootimg;
 pub mod cli;
 mod compat;
 mod compress;
