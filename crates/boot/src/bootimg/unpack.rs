@@ -155,6 +155,10 @@ fn pod_ref<T: Pod>(buf: &[u8]) -> Result<&T, UnpackError> {
 /// Follow-up commits will add Nook HD, Acclaim, Amonet, Z4, MTK,
 /// zImage + vendor_boot detection, matching the C++ loop's other
 /// cases one-by-one with their own tests.
+pub(crate) fn sniff_outer_for_repack(buf: &[u8]) -> (u32, usize) {
+    sniff_outer(buf)
+}
+
 fn sniff_outer(buf: &[u8]) -> (u32, usize) {
     let mut flags: u32 = 0;
     let mut i = 0usize;

@@ -10,7 +10,9 @@
 //! modules will own the parse / unpack / repack logic.
 
 pub mod hdr;
+pub mod repack;
 pub mod unpack;
 
 pub use hdr::*;
+pub use repack::{repack, RepackError};
 pub use unpack::{unpack, UnpackError, UnpackReport};
