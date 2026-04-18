@@ -1,14 +1,23 @@
-// Standalone FFI shim — replaces CXX bridge from upstream lib.rs
+// Crate-internal boot-image entry points.
 //
-// Upstream: lib.rs defines `#[cxx::bridge] pub mod ffi { ... }` with FileFormat enum
-// and C++ extern functions. This module provides the same types and function signatures
-// so that other .rs files can `use crate::ffi::*` unchanged.
+// Upstream Magisk v30.7 exposed these through a CXX bridge into
+// `cpp/bootimg.cpp`; this module is the Rust-native replacement so
+// every other file under `crates/boot/src/` can still `use
+// crate::ffi::*` with no signature churn. The actual parse /
+// unpack / repack / split logic lives in `bootimg/`. What stays
+// here:
 //
-// C++ functions (unpack, repack, cleanup, split_image_dtb, check_fmt) are stubbed
-// here and will be wired to actual C++ via CXX in Phase 3.
+// - `FileFormat` enum (matches upstream numbering for any caller
+//   that still round-trips it as `i32`).
+// - `check_fmt` magic-byte sniffer.
+// - Thin forwarders `unpack` / `repack` / `cleanup` /
+//   `split_image_dtb` that the CLI dispatches into.
+// - `BootImage` — a parsed view of a boot image on disk, backing
+//   the `sign.rs` verify path.
 
-/// File format enum — matches upstream CXX bridge definition exactly.
-/// Kept as a plain Rust enum instead of CXX-generated.
+/// File format enum — numbering matches upstream Magisk's CXX
+/// bridge definition so any caller round-tripping through `i32`
+/// stays compatible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 #[allow(non_camel_case_types)]

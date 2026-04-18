@@ -1,11 +1,15 @@
-// Standalone magiskboot library
+// Standalone magiskboot library — pure Rust, no C++ linkage.
 //
-// Upstream: lib.rs defines CXX bridge. This standalone version replaces
-// the CXX bridge with a Rust-native ffi module providing the same types.
+// Upstream Magisk v30.7 kept the boot-image parser / unpack / repack
+// in C++ and reached it from Rust through a CXX bridge. That shape
+// aborted the host process when LTBox v3's GUI used the crate
+// in-process on certain Lenovo ramdisks, so the boot-image
+// pipeline was rewritten in Rust (see `bootimg/`).
 //
-// Wrapper approach: boot module .rs files are kept as close to upstream
-// as possible. Differences are isolated in ffi.rs (shim) and compat
-// re-exports below.
+// Wrapper approach: every other `boot/` submodule is kept as close
+// to upstream as possible so future rebases stay cheap. The seam
+// that used to span the Rust/C++ boundary now lives entirely in
+// `ffi.rs` and `bootimg/`, plus the `compat` re-exports below.
 
 pub use base;
 // Re-export argh module so #[derive(FromArgs)] macro can resolve argh::*
