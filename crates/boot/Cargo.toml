@@ -9,11 +9,10 @@ path = "src/main.rs"
 
 [build-dependencies]
 pb-rs = "0.10"
-cc = "1"
 
 [dependencies]
 base = { path = "../base" }
-# cxx dependency removed — using cc + extern "C" wrapper instead
+# Boot-image pipeline is pure Rust — no C++ linkage required.
 # Compression
 flate2 = { version = "1", features = ["zlib-rs"] }
 bzip2 = "0.5"

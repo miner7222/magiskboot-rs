@@ -2,7 +2,9 @@ use pb_rs::ConfigBuilder;
 use pb_rs::types::FileDescriptor;
 
 fn main() {
-    // Protobuf codegen
+    // Protobuf codegen for the payload parser. The C++ build step
+    // that used to sit here was retired — the boot-image pipeline is
+    // fully Rust-side now (see `src/bootimg/`).
     println!("cargo:rerun-if-changed=proto/update_metadata.proto");
     let cb = ConfigBuilder::new(
         &["proto/update_metadata.proto"],
@@ -17,20 +19,4 @@ fn main() {
             .build(),
     )
     .unwrap();
-
-    // C++ compilation
-    println!("cargo:rerun-if-changed=cpp/bootimg.cpp");
-    println!("cargo:rerun-if-changed=cpp/wrapper.cpp");
-    println!("cargo:rerun-if-changed=cpp/bootimg.hpp");
-    println!("cargo:rerun-if-changed=cpp/magiskboot.hpp");
-    println!("cargo:rerun-if-changed=cpp/base.hpp");
-
-    cc::Build::new()
-        .cpp(true)
-        .std("c++20")
-        .file("cpp/bootimg.cpp")
-        .file("cpp/wrapper.cpp")
-        .include("cpp")
-        .warnings(false)
-        .compile("magiskboot-cpp");
 }

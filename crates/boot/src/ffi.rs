@@ -38,11 +38,9 @@ pub enum FileFormat {
 }
 
 // ---------------------------------------------------------------------------
-// C++ function stubs — will be replaced with actual CXX bridge in Phase 3
+// Format detection — pure Rust port of bootimg.cpp::check_fmt.
 // ---------------------------------------------------------------------------
 
-/// Format detection from magic bytes.
-/// Stub: reimplemented in Rust based on upstream bootimg.cpp check_fmt().
 pub fn check_fmt(buf: &[u8]) -> FileFormat {
     if buf.len() < 4 {
         return FileFormat::UNKNOWN;
@@ -129,38 +127,76 @@ pub fn check_fmt(buf: &[u8]) -> FileFormat {
 }
 
 // ---------------------------------------------------------------------------
-// C++ wrapper functions — linked via extern "C" from cpp/wrapper.cpp
+// Pure-Rust entry points — replace the previous CXX bridge to
+// `cpp/bootimg.cpp`. Each one forwards into the `bootimg::*` module,
+// using the current working directory as the work dir so the CLI
+// contract stays identical: drop sections into `./kernel`,
+// `./ramdisk.cpio`, ...
+//
+// Errors are folded into the upstream integer return shape — 0 on
+// success, 1 on failure for split, and the flag bitmask for unpack.
 // ---------------------------------------------------------------------------
 
-unsafe extern "C" {
-    fn magiskboot_unpack(image: *const std::ffi::c_char, skip_decomp: i32, hdr: i32) -> i32;
-    fn magiskboot_repack(src_img: *const std::ffi::c_char, out_img: *const std::ffi::c_char, skip_comp: i32);
-    fn magiskboot_split_image_dtb(filename: *const std::ffi::c_char, skip_decomp: i32) -> i32;
-    fn magiskboot_cleanup();
-}
-
-/// Clean up temporary files in current directory.
+/// Clean up temporary files in the current directory that `unpack`
+/// may have written. Silently ignores missing files.
 pub fn cleanup() {
-    unsafe { magiskboot_cleanup(); }
+    for name in [
+        "header",
+        "kernel",
+        "ramdisk.cpio",
+        "second",
+        "kernel_dtb",
+        "extra",
+        "recovery_dtbo",
+        "dtb",
+        "bootconfig",
+        "signature",
+    ] {
+        let _ = std::fs::remove_file(name);
+    }
+    let _ = std::fs::remove_dir_all("vendor_ramdisk");
 }
 
-/// Unpack boot image.
+/// Unpack a boot image into the current working directory.
+/// Returns the upstream-compatible flag bitmask on success, or `-1`
+/// on failure — callers pass this to `std::process::exit`.
 pub fn unpack(image: &str, skip_decomp: bool, hdr: bool) -> i32 {
-    let c_image = std::ffi::CString::new(image).unwrap();
-    unsafe { magiskboot_unpack(c_image.as_ptr(), skip_decomp as i32, hdr as i32) }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    match crate::bootimg::unpack(std::path::Path::new(image), &cwd, skip_decomp, hdr) {
+        Ok(report) => report.flags as i32,
+        Err(e) => {
+            eprintln!("! unpack failed: {e}");
+            -1
+        }
+    }
 }
 
-/// Repack boot image.
+/// Repack a boot image using sections from the current working
+/// directory.
 pub fn repack(src_img: &str, out_img: &str, skip_comp: bool) {
-    let c_src = std::ffi::CString::new(src_img).unwrap();
-    let c_out = std::ffi::CString::new(out_img).unwrap();
-    unsafe { magiskboot_repack(c_src.as_ptr(), c_out.as_ptr(), skip_comp as i32); }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if let Err(e) = crate::bootimg::repack(
+        std::path::Path::new(src_img),
+        &cwd,
+        std::path::Path::new(out_img),
+        skip_comp,
+    ) {
+        eprintln!("! repack failed: {e}");
+    }
 }
 
-/// Split image DTB.
+/// Split an appended-DTB kernel image into `./kernel` + `./kernel_dtb`.
+/// Returns `0` on success, `1` when no DTB was found — matches the
+/// upstream exit-code contract.
 pub fn split_image_dtb(filename: &str, skip_decomp: bool) -> i32 {
-    let c_filename = std::ffi::CString::new(filename).unwrap();
-    unsafe { magiskboot_split_image_dtb(c_filename.as_ptr(), skip_decomp as i32) }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    match crate::bootimg::split_image_dtb(std::path::Path::new(filename), &cwd, skip_decomp) {
+        Ok(rc) => rc,
+        Err(e) => {
+            eprintln!("! split failed: {e}");
+            1
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

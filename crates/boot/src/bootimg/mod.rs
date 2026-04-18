@@ -11,8 +11,10 @@
 
 pub mod hdr;
 pub mod repack;
+pub mod split;
 pub mod unpack;
 
 pub use hdr::*;
 pub use repack::{repack, RepackError};
+pub use split::{find_dtb_offset, split_image_dtb};
 pub use unpack::{unpack, UnpackError, UnpackReport};
