@@ -322,10 +322,13 @@ pub fn boot_main(cmds: CmdArgs) -> LoggedResult<i32> {
                 no_compress,
             );
         }
-        Action::Verify(Verify { img: _, cert: _ }) => {
-            // BootImage C++ integration not yet available
-            eprintln!("Warning: verify requires C++ BootImage integration");
-            return log_err!();
+        Action::Verify(Verify { img, cert }) => {
+            let bi = crate::ffi::BootImage::new(img.as_str());
+            if bi.payload().is_empty() {
+                eprintln!("! verify: unsupported image format");
+                return log_err!();
+            }
+            bi.verify(cert.as_deref())?;
         }
         Action::Sign(Sign {
             img,

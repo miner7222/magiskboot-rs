@@ -164,34 +164,74 @@ pub fn split_image_dtb(filename: &str, skip_decomp: bool) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// BootImage stub — will be replaced with CXX UniquePtr<boot_img> in Phase 3
+// BootImage — pure-Rust parse of an AOSP boot image. Mirrors
+// `cpp/bootimg.cpp::boot_img` for the fields LTBox + the `verify` /
+// `sign` CLI paths actually consume: `payload`, `tail`, `is_signed`,
+// `tail_off`.
+//
+// Coverage matches `bootimg::unpack`: AOSP v3 / v4, with outer
+// wrapper strip for ChromeOS / DHTB / Tegra Blob. Legacy v0..v2 +
+// vendor_boot are stubbed to empty payload/tail so callers see a
+// well-defined "unsupported" state rather than a panic.
 // ---------------------------------------------------------------------------
 
-/// Placeholder for C++ boot_img class.
+use crate::bootimg::hdr::{
+    BootImgHdrV3, BootImgHdrV4, AVB1_SIGNATURE_MAGIC, BOOT_MAGIC,
+};
+use crate::bootimg::unpack::sniff_outer_for_repack;
+
+/// Parsed view of a boot image held in memory.
 pub struct BootImage {
-    payload_data: Vec<u8>,
-    tail_data: Vec<u8>,
+    /// Owned backing buffer — the file's entire contents. `payload`
+    /// and `tail` reference slices into this.
+    buf: Vec<u8>,
+    /// `[start, end)` of the AOSP payload (header + all sections)
+    /// within `buf`. Zero-length for unsupported images.
+    payload_range: (usize, usize),
+    /// `[start, end)` of the trailing bytes past the AOSP payload.
+    tail_range: (usize, usize),
+    /// True iff the tail starts with the AVB1 `AVB\0` magic.
     signed: bool,
-    tail_offset: u64,
 }
 
 impl BootImage {
-    pub fn new(_img: &str) -> Box<BootImage> {
-        eprintln!("Warning: BootImage C++ integration not yet available");
+    /// Parse the boot image at `img`. Unsupported headers (v0..v2,
+    /// vendor_boot, broken files) collapse to empty ranges; callers
+    /// observe that via a zero-length `payload()` / `tail()`.
+    pub fn new(img: &str) -> Box<BootImage> {
+        let buf = match std::fs::read(img) {
+            Ok(b) => b,
+            Err(_) => {
+                return Box::new(BootImage {
+                    buf: Vec::new(),
+                    payload_range: (0, 0),
+                    tail_range: (0, 0),
+                    signed: false,
+                });
+            }
+        };
+
+        let (_flags, hdr_off) = sniff_outer_for_repack(&buf);
+        let (payload_end, tail_end) = compute_ranges(&buf, hdr_off);
+        let tail_range = (payload_end, tail_end);
+        let signed = tail_slice(&buf, tail_range)
+            .get(..AVB1_SIGNATURE_MAGIC.len())
+            .is_some_and(|m| m == AVB1_SIGNATURE_MAGIC);
+
         Box::new(BootImage {
-            payload_data: Vec::new(),
-            tail_data: Vec::new(),
-            signed: false,
-            tail_offset: 0,
+            buf,
+            payload_range: (hdr_off, payload_end),
+            tail_range,
+            signed,
         })
     }
 
     pub fn payload(&self) -> &[u8] {
-        &self.payload_data
+        payload_slice(&self.buf, self.payload_range)
     }
 
     pub fn tail(&self) -> &[u8] {
-        &self.tail_data
+        tail_slice(&self.buf, self.tail_range)
     }
 
     pub fn is_signed(&self) -> bool {
@@ -199,6 +239,164 @@ impl BootImage {
     }
 
     pub fn tail_off(&self) -> u64 {
-        self.tail_offset
+        self.tail_range.0 as u64
+    }
+}
+
+fn payload_slice(buf: &[u8], range: (usize, usize)) -> &[u8] {
+    if range.1 <= buf.len() && range.0 <= range.1 {
+        &buf[range.0..range.1]
+    } else {
+        &[]
+    }
+}
+
+fn tail_slice(buf: &[u8], range: (usize, usize)) -> &[u8] {
+    if range.1 <= buf.len() && range.0 <= range.1 {
+        &buf[range.0..range.1]
+    } else {
+        &[]
+    }
+}
+
+/// Return `(payload_end, tail_end)` indices for the AOSP image
+/// starting at `hdr_off` in `buf`. Unsupported headers return
+/// `(hdr_off, hdr_off)` so the caller sees empty ranges.
+fn compute_ranges(buf: &[u8], hdr_off: usize) -> (usize, usize) {
+    if hdr_off >= buf.len() {
+        return (hdr_off, hdr_off);
+    }
+    let payload = &buf[hdr_off..];
+    if payload.len() < BOOT_MAGIC.len() || &payload[..BOOT_MAGIC.len()] != BOOT_MAGIC {
+        return (hdr_off, hdr_off);
+    }
+    const HEADER_VERSION_OFFSET: usize = 40;
+    if payload.len() < HEADER_VERSION_OFFSET + 4 {
+        return (hdr_off, hdr_off);
+    }
+    let ver = u32::from_le_bytes(
+        payload[HEADER_VERSION_OFFSET..HEADER_VERSION_OFFSET + 4]
+            .try_into()
+            .unwrap(),
+    );
+    const PAGE: usize = 4096;
+    fn align_up(v: usize, a: usize) -> usize {
+        v.div_ceil(a) * a
+    }
+    let payload_end_rel = match ver {
+        3 => {
+            if payload.len() < std::mem::size_of::<BootImgHdrV3>() {
+                return (hdr_off, hdr_off);
+            }
+            let h: &BootImgHdrV3 =
+                bytemuck::from_bytes(&payload[..std::mem::size_of::<BootImgHdrV3>()]);
+            let k = h.kernel_size as usize;
+            let r = h.ramdisk_size as usize;
+            let kernel_off = PAGE;
+            let ramdisk_off = align_up(kernel_off + k, PAGE);
+            align_up(ramdisk_off + r, PAGE)
+        }
+        4 => {
+            if payload.len() < std::mem::size_of::<BootImgHdrV4>() {
+                return (hdr_off, hdr_off);
+            }
+            let h: &BootImgHdrV4 =
+                bytemuck::from_bytes(&payload[..std::mem::size_of::<BootImgHdrV4>()]);
+            let k = h.v3.kernel_size as usize;
+            let r = h.v3.ramdisk_size as usize;
+            let s = h.signature_size as usize;
+            let kernel_off = PAGE;
+            let ramdisk_off = align_up(kernel_off + k, PAGE);
+            let signature_off = align_up(ramdisk_off + r, PAGE);
+            if s > 0 {
+                align_up(signature_off + s, PAGE)
+            } else {
+                signature_off
+            }
+        }
+        _ => {
+            // Unsupported versions: no payload/tail decode.
+            return (hdr_off, hdr_off);
+        }
+    };
+    let payload_end = hdr_off + payload_end_rel;
+    let tail_end = buf.len().min(align_up(buf.len(), PAGE));
+    if payload_end > buf.len() {
+        return (hdr_off, hdr_off);
+    }
+    (payload_end, tail_end.max(payload_end))
+}
+
+#[cfg(test)]
+mod bootimage_tests {
+    use super::*;
+    use crate::bootimg::hdr::BOOT_MAGIC;
+    use std::mem::size_of;
+
+    fn build_v3(kernel: &[u8], ramdisk: &[u8], tail: &[u8]) -> Vec<u8> {
+        const PAGE: usize = 4096;
+        let mut hdr = vec![0u8; size_of::<BootImgHdrV3>()];
+        hdr[..8].copy_from_slice(BOOT_MAGIC);
+        hdr[8..12].copy_from_slice(&(kernel.len() as u32).to_le_bytes());
+        hdr[12..16].copy_from_slice(&(ramdisk.len() as u32).to_le_bytes());
+        hdr[40..44].copy_from_slice(&3u32.to_le_bytes());
+        let mut out = hdr;
+        while out.len() < PAGE {
+            out.push(0);
+        }
+        out.extend_from_slice(kernel);
+        while out.len() % PAGE != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(ramdisk);
+        while out.len() % PAGE != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(tail);
+        out
+    }
+
+    #[test]
+    fn parses_payload_and_tail_ranges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let img_bytes = build_v3(&b"K".repeat(10), &b"R".repeat(10), b"TAILBYTES");
+        let img_path = tmp.path().join("boot.img");
+        std::fs::write(&img_path, &img_bytes).unwrap();
+        let bi = BootImage::new(img_path.to_str().unwrap());
+        // Payload ends at 8192 (page 0 header + page 1 kernel + page 2 ramdisk).
+        assert_eq!(bi.payload().len(), 12288);
+        assert_eq!(bi.tail_off(), 12288);
+        // Tail contains our TAILBYTES marker.
+        assert!(bi.tail().starts_with(b"TAILBYTES"));
+        assert!(!bi.is_signed());
+    }
+
+    #[test]
+    fn flags_avb1_signed_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let img_bytes = build_v3(&b"K".repeat(5), &b"R".repeat(5), b"AVB\x00rest");
+        let img_path = tmp.path().join("signed.img");
+        std::fs::write(&img_path, &img_bytes).unwrap();
+        let bi = BootImage::new(img_path.to_str().unwrap());
+        assert!(bi.is_signed());
+    }
+
+    #[test]
+    fn missing_file_yields_empty_ranges() {
+        let bi = BootImage::new("this/path/does/not/exist.img");
+        assert!(bi.payload().is_empty());
+        assert!(bi.tail().is_empty());
+        assert!(!bi.is_signed());
+        assert_eq!(bi.tail_off(), 0);
+    }
+
+    #[test]
+    fn non_aosp_bytes_yield_empty_ranges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let img_path = tmp.path().join("junk.img");
+        std::fs::write(&img_path, vec![0xffu8; 4096]).unwrap();
+        let bi = BootImage::new(img_path.to_str().unwrap());
+        assert!(bi.payload().is_empty());
+        assert!(bi.tail().is_empty());
     }
 }
