@@ -356,7 +356,8 @@ pub fn boot_main(cmds: CmdArgs) -> LoggedResult<i32> {
             }
         }
         Action::Cpio(Cpio { file, cmds }) => {
-            cpio_commands(&file, &cmds).log_with_msg(|w| w.write_str("Failed to process cpio"))?;
+            return cpio_commands(&file, &cmds)
+                .log_with_msg(|w| w.write_str("Failed to process cpio"));
         }
         Action::Dtb(Dtb { file, action }) => {
             return dtb_commands(&file, &action)

@@ -10,7 +10,6 @@ use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::mem::size_of;
-use std::process::exit;
 use std::str;
 
 use crate::check_env;
@@ -758,7 +757,21 @@ impl Display for CpioEntry {
     }
 }
 
-pub(crate) fn cpio_commands(file: &Utf8CStr, cmds: &Vec<String>) -> LoggedResult<()> {
+/// Execute a series of cpio commands and return an upstream-
+/// compatible exit code (0 / 1 / 2 — the `test` sub-command encodes
+/// its result in this bitmask per upstream Magisk). Every other
+/// sub-command reports success as `0` and propagates errors through
+/// `LoggedResult::Err`.
+///
+/// Upstream's code called `std::process::exit(cpio.test())` here,
+/// which is fine inside a CLI subprocess but kills the whole host
+/// process when `magiskboot` is used as an in-process Rust library
+/// — the reason LTBox v3's GUI vanished mid-Magisk-patch once the
+/// pipeline started calling `magiskboot cpio ramdisk.cpio test`.
+/// Threading the status through the return value lets the CLI
+/// front-end forward it to `std::process::exit` at the binary
+/// entry while keeping library callers alive.
+pub(crate) fn cpio_commands(file: &Utf8CStr, cmds: &Vec<String>) -> LoggedResult<i32> {
     let mut cpio = if file.exists() {
         Cpio::load_from_file(file)?
     } else {
@@ -779,12 +792,12 @@ pub(crate) fn cpio_commands(file: &Utf8CStr, cmds: &Vec<String>) -> LoggedResult
         .on_early_exit(print_cpio_usage);
 
         match &mut cmd.action {
-            CpioAction::Test(_) => exit(cpio.test()),
+            CpioAction::Test(_) => return Ok(cpio.test()),
             CpioAction::Restore(_) => cpio.restore()?,
             CpioAction::Patch(_) => cpio.patch(),
             CpioAction::Exists(Exists { path }) => {
                 return if cpio.exists(path) {
-                    Ok(())
+                    Ok(0)
                 } else {
                     log_err!()
                 };
@@ -807,12 +820,12 @@ pub(crate) fn cpio_commands(file: &Utf8CStr, cmds: &Vec<String>) -> LoggedResult
             }
             CpioAction::List(List { path, recursive }) => {
                 cpio.ls(path.as_str(), *recursive);
-                return Ok(());
+                return Ok(0);
             }
         };
     }
     cpio.dump(file)?;
-    Ok(())
+    Ok(0)
 }
 
 fn x8u(x: &[u8; 8]) -> LoggedResult<u32> {
