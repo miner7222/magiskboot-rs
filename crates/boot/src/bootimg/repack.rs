@@ -138,7 +138,6 @@ fn repack_v3(
     let kernel_off = PAGE;
     let ramdisk_off = align_to((kernel_off + src_kernel_size) as u64, PAGE as u64) as usize;
     let src_tail_off_rel = align_to((ramdisk_off + src_ramdisk_size) as u64, PAGE as u64) as usize;
-    let src_tail_off_abs = hdr_off + src_tail_off_rel;
 
     let mut out: Vec<u8> = Vec::with_capacity(src.len());
     // 1. Wrapper bytes verbatim.
@@ -178,14 +177,23 @@ fn repack_v3(
     new_hdr.ramdisk_size = new_ramdisk_size as u32;
     pad_to(&mut out, out_hdr_off, PAGE);
 
-    // 5. Tail (AVB / appended data) verbatim from source. Must be
-    //    the last write — any subsequent zero-pad would push the
-    //    AVB2 footer (last 64 bytes of the source tail) away from
-    //    EOF, which breaks downstream `avbtool erase_footer` calls
-    //    (they look at the final 64 bytes for `AVBf` magic).
-    if src_tail_off_abs < src.len() {
-        out.extend_from_slice(&src[src_tail_off_abs..]);
-    }
+    // 5. Deliberately drop the source tail (AVB footer + vbmeta +
+    //    zero padding). Copying it verbatim caused a nasty
+    //    truncation bug: when the replacement kernel / ramdisk
+    //    grew past the original section end, the appended source
+    //    tail carried a stale `AvbFooter.original_image_size`
+    //    pointing at the *old* section end. A downstream `avbtool
+    //    erase_footer` call read that value and truncated the new
+    //    file back to the old size, amputating the replacement
+    //    payload and producing a non-booting image.
+    //
+    //    The LTBox root pipeline always follows this repack with
+    //    `erase_footer + add_hash_footer`, so the AVB layout is
+    //    rebuilt from scratch anyway — re-emitting the source tail
+    //    is not needed for correctness and actively hurts when
+    //    section sizes change. Standalone CLI usage that expects a
+    //    drop-in-replacement signed image is deferred to a follow-up
+    //    (would require porting the C++ `patch AvbFooter` step).
 
     // 6. Patch header in place with the rewritten sizes.
     patch_v3_header(&mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV3>()], &new_hdr);
@@ -223,7 +231,6 @@ fn repack_v4(
     } else {
         signature_off
     };
-    let src_tail_off_abs = hdr_off + src_tail_off_rel;
 
     let mut out: Vec<u8> = Vec::with_capacity(src.len());
     out.extend_from_slice(&src[..hdr_off]);
@@ -276,12 +283,10 @@ fn repack_v4(
         pad_to(&mut out, out_hdr_off, PAGE);
     }
 
-    // Tail verbatim — must be the last write so the AVB2 footer
-    // (last 64 bytes of source tail) stays at EOF for downstream
-    // `avbtool erase_footer` to find.
-    if src_tail_off_abs < src.len() {
-        out.extend_from_slice(&src[src_tail_off_abs..]);
-    }
+    // Source-tail copy intentionally omitted — see `repack_v3` for
+    // the rationale. LTBox rebuilds AVB with its own `avbtool`
+    // invocation after repack, so reusing the stale source footer
+    // would corrupt the new image when section sizes grow.
 
     patch_v4_header(&mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV4>()], &new_hdr);
 
@@ -563,11 +568,10 @@ mod tests {
         let dst = tmp.path().join("dst.img");
         repack(&src, &work, &dst, /*skip_comp=*/ true).unwrap();
 
-        let dst_bytes = std::fs::read(&dst).unwrap();
-        // Padded to source length.
-        assert_eq!(dst_bytes.len(), img_bytes.len());
-
-        // Re-unpack and verify content parity.
+        // Re-unpack and verify section content parity. The source
+        // tail is intentionally dropped by repack — the LTBox root
+        // pipeline rebuilds AVB via avbtool afterwards, so tail
+        // verbatim is not kept.
         let work2 = tmp.path().join("work2");
         unpack(&dst, &work2, /*skip_decompress=*/ true, false).unwrap();
         assert_eq!(std::fs::read(work2.join("kernel")).unwrap(), kernel);
@@ -575,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn repack_v4_round_trip_preserves_signature_and_tail() {
+    fn repack_v4_round_trip_preserves_signature() {
         let tmp = tempfile::tempdir().unwrap();
         let kernel = b"k".repeat(111);
         let ramdisk = b"r".repeat(222);
@@ -591,12 +595,9 @@ mod tests {
         let dst = tmp.path().join("dst.img");
         repack(&src, &work, &dst, true).unwrap();
 
-        let dst_bytes = std::fs::read(&dst).unwrap();
-        assert_eq!(dst_bytes.len(), img_bytes.len());
-        // Tail byte-exact preservation.
-        assert_eq!(&dst_bytes[dst_bytes.len() - tail.len()..], tail.as_slice());
-
-        // Re-unpack verifies section bytes round-trip.
+        // Re-unpack verifies section bytes round-trip. Signature
+        // section (which lives inside the AOSP payload, not the
+        // tail) is preserved via the normal repack path.
         let work2 = tmp.path().join("work2");
         unpack(&dst, &work2, true, false).unwrap();
         assert_eq!(std::fs::read(work2.join("kernel")).unwrap(), kernel);
