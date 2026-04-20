@@ -2,8 +2,8 @@
 //
 // Upstream Magisk v30.7 kept the boot-image parser / unpack / repack
 // in C++ and reached it from Rust through a CXX bridge. That shape
-// aborted the host process when LTBox v3's GUI used the crate
-// in-process on certain Lenovo ramdisks, so the boot-image
+// aborted the host process when a host application used the crate
+// in-process on certain vendor ramdisks, so the boot-image
 // pipeline was rewritten in Rust (see `bootimg/`).
 //
 // Wrapper approach: every other `boot/` submodule is kept as close

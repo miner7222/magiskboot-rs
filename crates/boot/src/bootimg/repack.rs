@@ -187,7 +187,7 @@ fn repack_v3(
     //    file back to the old size, amputating the replacement
     //    payload and producing a non-booting image.
     //
-    //    The LTBox root pipeline always follows this repack with
+    //    The downstream root pipeline always follows this repack with
     //    `erase_footer + add_hash_footer`, so the AVB layout is
     //    rebuilt from scratch anyway — re-emitting the source tail
     //    is not needed for correctness and actively hurts when
@@ -284,9 +284,9 @@ fn repack_v4(
     }
 
     // Source-tail copy intentionally omitted — see `repack_v3` for
-    // the rationale. LTBox rebuilds AVB with its own `avbtool`
-    // invocation after repack, so reusing the stale source footer
-    // would corrupt the new image when section sizes grow.
+    // the rationale. Downstream tooling rebuilds AVB with its own
+    // `avbtool` invocation after repack, so reusing the stale source
+    // footer would corrupt the new image when section sizes grow.
 
     patch_v4_header(&mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV4>()], &new_hdr);
 
@@ -569,8 +569,8 @@ mod tests {
         repack(&src, &work, &dst, /*skip_comp=*/ true).unwrap();
 
         // Re-unpack and verify section content parity. The source
-        // tail is intentionally dropped by repack — the LTBox root
-        // pipeline rebuilds AVB via avbtool afterwards, so tail
+        // tail is intentionally dropped by repack — the downstream
+        // root pipeline rebuilds AVB via avbtool afterwards, so tail
         // verbatim is not kept.
         let work2 = tmp.path().join("work2");
         unpack(&dst, &work2, /*skip_decompress=*/ true, false).unwrap();
@@ -634,9 +634,9 @@ mod tests {
         assert!(matches!(err, RepackError::UnsupportedVersion(2)));
     }
 
-    /// Round-trip TB322FC Lenovo images: unpack → repack → re-unpack,
+    /// Round-trip real vendor images: unpack → repack → re-unpack,
     /// verify kernel + ramdisk.cpio bytes match on every hop.
-    /// Skipped unless `LTBOX_TB322_IMAGES` points at the firmware dir.
+    /// Skipped unless the env var (see body) points at a firmware dir.
     #[test]
     fn repack_tb322fc_samples_round_trip() {
         let Ok(dir) = std::env::var("LTBOX_TB322_IMAGES") else {
@@ -679,8 +679,8 @@ mod tests {
     }
 
     /// Byte-for-byte parity against a C++ `magiskboot repack` result.
-    /// Runs only when `LTBOX_PARITY_CPP_REPACK` names a directory that
-    /// contains:
+    /// Runs only when the reference env var (see body) names a
+    /// directory that contains:
     ///
     /// - `src.img`       — original source image
     /// - `work/kernel`, `work/ramdisk.cpio` (+ `signature` for v4) —
@@ -690,8 +690,8 @@ mod tests {
     /// We invoke the Rust repack with the same inputs and compare
     /// byte-for-byte. Only passes when both tools agree bit-exactly
     /// — currently expected only for `skip_comp = true`, since
-    /// compressed output byte-drifts between libraries. The env
-    /// variable `LTBOX_PARITY_REPACK_SKIP_COMP` gates that mode.
+    /// compressed output byte-drifts between libraries. A secondary
+    /// env var (see body) gates that mode.
     #[test]
     fn repack_byte_matches_cpp_reference() {
         let Ok(dir) = std::env::var("LTBOX_PARITY_CPP_REPACK") else {

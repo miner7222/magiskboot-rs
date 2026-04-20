@@ -39,7 +39,7 @@ Supported compression formats: `gzip`, `zopfli`, `xz`, `lzma`,
 
 ## Boot Image Coverage
 
-The pure-Rust `bootimg` pipeline covers the slice LTBox's Magisk /
+The pure-Rust `bootimg` pipeline covers the slice real Magisk /
 KernelSU / APatch Root flows actually use:
 
 - AOSP boot image header **v3** and **v4**
@@ -48,7 +48,7 @@ KernelSU / APatch Root flows actually use:
 - AVB2 footer + vbmeta tail preserved byte-for-byte through
   unpack / repack
 
-**Deferred** (targeted follow-ups — not blocking the LTBox use
+**Deferred** (targeted follow-ups — not blocking the primary use
 case): vendor_boot v3/v4, legacy header versions v0/v1/v2 plus
 Samsung PXA, MTK / Nook / Acclaim / Amonet / Z4 / zImage kernel
 wrappers, SHA-1 / SHA-256 `id` field patching for v0–v2, AVB1
@@ -107,14 +107,10 @@ format sniffer.
 
 ### Live device-image smoke tests
 
-Two TB322FC (Lenovo Legion Tab Y700) smoke tests exercise the
-unpack and unpack → repack → unpack round-trip against real vendor
-images. Enable by pointing `LTBOX_TB322_IMAGES` at a directory that
-contains `init_boot.img` and/or `boot.img`:
-
-```
-LTBOX_TB322_IMAGES=/path/to/firmware cargo test -p magiskboot bootimg:: -- --nocapture
-```
+Opt-in smoke tests exercise the unpack and unpack → repack →
+unpack round-trip against real vendor images. See the gated
+`#[test]` functions under `crates/boot/src/bootimg/` for the env
+vars that enable them.
 
 Assertions cover: header version 4, post-round-trip kernel +
 `ramdisk.cpio` byte-for-byte parity with the source.
@@ -122,19 +118,10 @@ Assertions cover: header version 4, post-round-trip kernel +
 ### C++ parity corpus
 
 Two gated tests line the Rust output up against a reference C++
-`magiskboot unpack` / `repack` run:
-
-- `unpack_byte_matches_cpp_reference` — set `LTBOX_PARITY_CPP` to
-  a directory already populated by a prior `magiskboot unpack` from
-  the v30.7 C++ build, plus the source `.img` sitting next to the
-  reference files. Every section the C++ binary produced must land
-  byte-identical in the Rust output.
-- `repack_byte_matches_cpp_reference` — set
-  `LTBOX_PARITY_CPP_REPACK` to a directory holding `src.img`,
-  `work/` (with `kernel`, `ramdisk.cpio`, optional `signature`),
-  and `cpp.img` (the C++ repack output). Optional
-  `LTBOX_PARITY_REPACK_SKIP_COMP` forces `skip_comp=true`, the only
-  mode where byte parity is achievable across compression codecs.
+`magiskboot unpack` / `repack` run. They compare every section the
+C++ binary produces against the Rust output byte-for-byte. See the
+gated `#[test]` functions under `crates/boot/src/bootimg/` for the
+env vars that enable them.
 
 ### End-to-end Magisk root patch parity
 
@@ -208,7 +195,7 @@ Procedure:
      wrappers differ, the payloads (the actual `magisk`, `stub.apk`,
      `init-ld` binaries Magisk injects) do not.
 
-TB322FC Lenovo firmware has been verified end-to-end with this
+Real vendor firmware has been verified end-to-end with this
 procedure — every injected payload matches the v30.7 C++ reference
 after decompression.
 

@@ -210,9 +210,9 @@ pub fn split_image_dtb(filename: &str, skip_decomp: bool) -> i32 {
 
 // ---------------------------------------------------------------------------
 // BootImage — pure-Rust parse of an AOSP boot image. Mirrors
-// `cpp/bootimg.cpp::boot_img` for the fields LTBox + the `verify` /
-// `sign` CLI paths actually consume: `payload`, `tail`, `is_signed`,
-// `tail_off`.
+// `cpp/bootimg.cpp::boot_img` for the fields downstream callers +
+// the `verify` / `sign` CLI paths actually consume: `payload`,
+// `tail`, `is_signed`, `tail_off`.
 //
 // Coverage matches `bootimg::unpack`: AOSP v3 / v4, with outer
 // wrapper strip for ChromeOS / DHTB / Tegra Blob. Legacy v0..v2 +

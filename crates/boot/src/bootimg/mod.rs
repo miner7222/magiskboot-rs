@@ -4,8 +4,8 @@
 //! The upstream `magiskboot` built its boot-image parser in C++ and
 //! called it from Rust via a CXX bridge. That worked on the CLI
 //! binary but aborted the whole process when the same code ran
-//! in-process from a Windows Rust host (LTBox v3's GUI) on some
-//! Lenovo ramdisks.
+//! in-process from a Windows Rust host application on some
+//! vendor ramdisks.
 //!
 //! Scope of this module:
 //!

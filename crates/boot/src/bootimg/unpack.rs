@@ -3,13 +3,13 @@
 //!
 //! This turn seeds the AOSP v3 / v4 boot_img path (no vendor_boot,
 //! no v0 / v1 / v2 / PXA, no MTK, no zImage kernel carve). That
-//! covers every image the Phase-7 user-facing target ships — Lenovo
-//! TB320 / TB322FC firmware uses AOSP v4 for both `boot.img` and
+//! covers every image the Phase-7 user-facing target ships — real
+//! vendor firmware uses AOSP v4 for both `boot.img` and
 //! `init_boot.img`. Follow-up commits add vendor_boot + legacy
 //! versions + the exotic wrappers.
 //!
 //! The exit-code bitmask returned by [`unpack`] stays
-//! binary-compatible with the upstream C++ build — LTBox reads
+//! binary-compatible with the upstream C++ build — callers read
 //! individual bits to drive downstream logic (e.g. whether AVB
 //! re-signing is required).
 
@@ -70,8 +70,9 @@ pub enum UnpackError {
 /// are decompressed transparently unless `skip_decompress` is `true`.
 ///
 /// `write_header_txt` controls whether a `header` text file with
-/// `key=value` lines lands next to the sections — LTBox does not
-/// rely on this today but upstream CLI exposes it via `--header-file`.
+/// `key=value` lines lands next to the sections — library callers
+/// do not rely on this today but upstream CLI exposes it via
+/// `--header-file`.
 ///
 /// Returns an [`UnpackReport`] whose `flags` field is the
 /// `exit(...)` bitmask the CLI should return.
@@ -511,19 +512,19 @@ mod tests {
         assert!(matches!(err, UnpackError::UnsupportedVersion(2)));
     }
 
-    /// Hardware-in-the-loop smoke test — runs only when the
-    /// `LTBOX_TB322_IMAGES` env var points at a firmware directory
-    /// with TB322FC's `init_boot.img` and `boot.img`. Skipped
-    /// otherwise so the default `cargo test` stays hermetic.
+    /// Hardware-in-the-loop smoke test — runs only when the env var
+    /// (see body) points at a firmware directory with
+    /// `init_boot.img` and `boot.img`. Skipped otherwise so the
+    /// default `cargo test` stays hermetic.
     ///
     /// We assert just layout-level invariants:
     ///
-    /// - Header version is 4 (both Lenovo images).
+    /// - Header version is 4 (both vendor images).
     /// - Every non-empty section the header advertises actually
     ///   lands on disk with the declared byte count.
     ///
     /// AVB signature-block checks are deliberately absent — some
-    /// Lenovo v4 images leave `signature_size = 0` and carry their
+    /// vendor v4 images leave `signature_size = 0` and carry their
     /// AVB2 footer as an appended tail instead. Tail detection is
     /// added in the next sub-phase.
     #[test]
@@ -562,15 +563,15 @@ mod tests {
     }
 
     /// Byte-for-byte parity against the C++ `magiskboot unpack`
-    /// output. Runs only when `LTBOX_PARITY_CPP` points at a
-    /// directory that already contains the reference outputs a
-    /// previous `magiskboot.exe` run produced in an otherwise-empty
-    /// folder (the original `init_boot.img` must sit next to the
-    /// reference `ramdisk.cpio`).
+    /// output. Runs only when the reference env var (see body)
+    /// points at a directory that already contains the reference
+    /// outputs a previous `magiskboot.exe` run produced in an
+    /// otherwise-empty folder (the original `init_boot.img` must
+    /// sit next to the reference `ramdisk.cpio`).
     ///
     /// This closes the loop on 7B: an unnoticed byte-drift in
     /// either the header carve or the downstream decompression
-    /// trips here before it trips LTBox's Magisk patch.
+    /// trips here before it trips downstream Magisk patching.
     #[test]
     fn unpack_byte_matches_cpp_reference() {
         let Ok(ref_dir) = std::env::var("LTBOX_PARITY_CPP") else {

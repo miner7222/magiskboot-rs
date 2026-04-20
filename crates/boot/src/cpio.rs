@@ -766,8 +766,8 @@ impl Display for CpioEntry {
 /// Upstream's code called `std::process::exit(cpio.test())` here,
 /// which is fine inside a CLI subprocess but kills the whole host
 /// process when `magiskboot` is used as an in-process Rust library
-/// — the reason LTBox v3's GUI vanished mid-Magisk-patch once the
-/// pipeline started calling `magiskboot cpio ramdisk.cpio test`.
+/// — the reason embedding host processes vanished mid-Magisk-patch
+/// once the pipeline started calling `magiskboot cpio ramdisk.cpio test`.
 /// Threading the status through the return value lets the CLI
 /// front-end forward it to `std::process::exit` at the binary
 /// entry while keeping library callers alive.
