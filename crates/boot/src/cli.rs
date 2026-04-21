@@ -13,7 +13,7 @@ use crate::sign::{sha1_hash, sign_boot_image};
 use base::argh::{CommandInfo, EarlyExit, FromArgs, SubCommand};
 use base::{
     CmdArgs, EarlyExitExt, LoggedResult, MappedFile, PositionalArgParser, ResultExt, Utf8CStr,
-    Utf8CString, cstr, log_err,
+    Utf8CString, WriteExt, cstr, log_err,
 };
 use std::io::{Seek, SeekFrom, Write};
 use std::str::FromStr;
@@ -263,18 +263,27 @@ fn sign_cmd(
     cert: Option<&Utf8CStr>,
     key: Option<&Utf8CStr>,
 ) -> LoggedResult<()> {
-    let _img_path = image.as_str();
     let name = name.unwrap_or(cstr!("/boot"));
-    // BootImage C++ integration not yet available
-    // For now, read the file directly
-    let payload = std::fs::read(image.as_str())?;
-    let sig = sign_boot_image(&payload, name, cert, key)?;
-    // Append signature to file
+    let img = crate::ffi::BootImage::new(image.as_str());
+    if img.payload().is_empty() {
+        eprintln!("! sign: unsupported image format");
+        return log_err!();
+    }
+    let sig = sign_boot_image(img.payload(), name, cert, key)?;
+    let tail_off = img.tail_off();
+    drop(img);
+
     let mut fd = std::fs::OpenOptions::new()
         .write(true)
         .open(image.as_str())?;
-    fd.seek(SeekFrom::End(0))?;
+    fd.seek(SeekFrom::Start(tail_off))?;
     fd.write_all(&sig)?;
+    let current = fd.stream_position()?;
+    let eof = fd.seek(SeekFrom::End(0))?;
+    if eof > current {
+        fd.seek(SeekFrom::Start(current))?;
+        fd.write_zeros((eof - current) as usize)?;
+    }
     Ok(())
 }
 

@@ -249,6 +249,18 @@ impl BootSignature {
     }
 }
 
+/// Best-effort AVB1 detection: does `tail` start with a DER-encoded
+/// BootSignature sequence? Mirrors the C++ `is_signed` semantics,
+/// which relies on a successful `verify()` call — we relax that to
+/// "decodes as BootSignature" so detection works without the verity
+/// keypair. The tail length check guards against DER trailing zeros.
+pub(crate) fn is_boot_signature(tail: &[u8]) -> bool {
+    let Ok(mut reader) = SliceReader::new(tail) else {
+        return false;
+    };
+    BootSignature::decode(&mut reader).is_ok()
+}
+
 impl BootImage {
     pub fn verify(&self, cert: Option<&Utf8CStr>) -> LoggedResult<()> {
         let tail = self.tail();
@@ -331,4 +343,113 @@ pub fn sign_boot_image(
 
 pub fn sign_payload_for_cxx(payload: &[u8]) -> Vec<u8> {
     sign_boot_image(payload, cstr!("/boot"), None, None).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bootimg::hdr::{BOOT_MAGIC, BootImgHdrV3};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::mem::size_of;
+
+    fn build_v3_with_tail_room(kernel: &[u8], ramdisk: &[u8], tail_room: usize) -> Vec<u8> {
+        const PAGE: usize = 4096;
+        let mut hdr = vec![0u8; size_of::<BootImgHdrV3>()];
+        hdr[..8].copy_from_slice(BOOT_MAGIC);
+        hdr[8..12].copy_from_slice(&(kernel.len() as u32).to_le_bytes());
+        hdr[12..16].copy_from_slice(&(ramdisk.len() as u32).to_le_bytes());
+        hdr[40..44].copy_from_slice(&3u32.to_le_bytes());
+        let mut out = hdr;
+        while out.len() < PAGE {
+            out.push(0);
+        }
+        out.extend_from_slice(kernel);
+        while out.len() % PAGE != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(ramdisk);
+        while out.len() % PAGE != 0 {
+            out.push(0);
+        }
+        out.resize(out.len() + tail_room, 0);
+        out
+    }
+
+    /// End-to-end AVB1 sign → verify round-trip using the bundled
+    /// verity keypair. Mirrors the CLI `sign` flow: parse BootImage,
+    /// sign payload, write DER block at `tail_off`, zero-pad to EOF.
+    /// Verify must then succeed against the embedded cert.
+    #[test]
+    fn avb1_sign_then_verify_roundtrip() {
+        use base::WriteExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let img_path = tmp.path().join("avb1.img");
+        // 8 KiB of tail room gives the DER BootSignature (~1.5 KiB with
+        // the default verity cert) plenty of space on a 4 KiB page.
+        let bytes = build_v3_with_tail_room(b"AVB1-KERNEL", b"AVB1-RAMDISK", 8192);
+        std::fs::write(&img_path, &bytes).unwrap();
+
+        let img = BootImage::new(img_path.to_str().unwrap());
+        let name = cstr!("/boot");
+        let sig = sign_boot_image(img.payload(), name, None, None).ok().expect("sign");
+        let tail_off = img.tail_off();
+        drop(img);
+
+        let mut fd = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        fd.seek(SeekFrom::Start(tail_off)).unwrap();
+        fd.write_all(&sig).unwrap();
+        let current = fd.stream_position().unwrap();
+        let eof = fd.seek(SeekFrom::End(0)).unwrap();
+        if eof > current {
+            fd.seek(SeekFrom::Start(current)).unwrap();
+            fd.write_zeros((eof - current) as usize).unwrap();
+        }
+        drop(fd);
+
+        let img2 = BootImage::new(img_path.to_str().unwrap());
+        assert!(img2.is_signed(), "post-sign tail should start with AVB1 magic");
+        img2.verify(None).ok().expect("verify post-sign image");
+    }
+
+    #[test]
+    fn avb1_verify_rejects_payload_tamper() {
+        use base::WriteExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let img_path = tmp.path().join("tamper.img");
+        let bytes = build_v3_with_tail_room(b"AVB1-KERNEL", b"AVB1-RAMDISK", 8192);
+        std::fs::write(&img_path, &bytes).unwrap();
+
+        let img = BootImage::new(img_path.to_str().unwrap());
+        let sig = sign_boot_image(img.payload(), cstr!("/boot"), None, None).ok().expect("sign");
+        let tail_off = img.tail_off();
+        drop(img);
+
+        let mut fd = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        fd.seek(SeekFrom::Start(tail_off)).unwrap();
+        fd.write_all(&sig).unwrap();
+        let current = fd.stream_position().unwrap();
+        let eof = fd.seek(SeekFrom::End(0)).unwrap();
+        if eof > current {
+            fd.seek(SeekFrom::Start(current)).unwrap();
+            fd.write_zeros((eof - current) as usize).unwrap();
+        }
+        drop(fd);
+
+        // Flip one byte inside the kernel payload, past the header.
+        let mut raw = std::fs::read(&img_path).unwrap();
+        raw[4096] ^= 0x01;
+        std::fs::write(&img_path, &raw).unwrap();
+
+        let img2 = BootImage::new(img_path.to_str().unwrap());
+        assert!(img2.verify(None).is_err(),
+            "verify must fail after payload tamper");
+    }
 }

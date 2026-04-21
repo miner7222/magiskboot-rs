@@ -13,14 +13,13 @@ use std::mem::size_of;
 use std::str;
 
 use crate::check_env;
+use crate::compat::libc_compat::{
+    S_IFBLK, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP,
+    S_IWOTH, S_IWUSR, S_IXGRP, S_IXOTH, S_IXUSR, dev_t, gid_t, makedev, mknod, mode_t, uid_t,
+};
 use crate::compress::{get_decoder, get_encoder};
 use crate::ffi::FileFormat;
 use crate::patch::{patch_encryption, patch_verity};
-use crate::compat::libc_compat::{
-    S_IFBLK, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP,
-    S_IWOTH, S_IWUSR, S_IXGRP, S_IXOTH, S_IXUSR, dev_t, gid_t, makedev, mknod,
-    mode_t, uid_t,
-};
 use base::{
     BytesExt, EarlyExitExt, LoggedResult, MappedFile, OptionExt, ResultExt, Utf8CStr, Utf8CStrBuf,
     WriteExt, cstr, log_err,
@@ -396,8 +395,7 @@ impl Cpio {
 
         // Treat symlinks as regular files as symlinks are created by the 'ln TARGET ENTRY' command
         let mode = if metadata.is_file() || metadata.is_symlink() {
-            std::fs::File::open(file.as_str())?
-                .read_to_end(&mut content)?;
+            std::fs::File::open(file.as_str())?.read_to_end(&mut content)?;
             mode | S_IFREG
         } else {
             // On Windows, block/char devices are not supported; treat as unsupported
@@ -796,11 +794,7 @@ pub(crate) fn cpio_commands(file: &Utf8CStr, cmds: &Vec<String>) -> LoggedResult
             CpioAction::Restore(_) => cpio.restore()?,
             CpioAction::Patch(_) => cpio.patch(),
             CpioAction::Exists(Exists { path }) => {
-                return if cpio.exists(path) {
-                    Ok(0)
-                } else {
-                    log_err!()
-                };
+                return if cpio.exists(path) { Ok(0) } else { log_err!() };
             }
             CpioAction::Backup(Backup {
                 origin,

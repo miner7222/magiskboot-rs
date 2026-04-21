@@ -42,17 +42,30 @@ Supported compression formats: `gzip`, `zopfli`, `xz`, `lzma`,
 The pure-Rust `bootimg` pipeline covers the slice real Magisk /
 KernelSU / APatch Root flows actually use:
 
-- AOSP boot image header **v3** and **v4**
-- Outer wrappers: direct AOSP, ChromeOS, DHTB, Tegra Blob
+- AOSP boot image header **v0**, **v1**, **v2**, **v3**, **v4**
+- Samsung **PXA** variant (page_size sentinel ≥ `0x02000000`)
+- **vendor_boot** header v3 and v4 (multi-ramdisk table + bootconfig)
+- Outer whole-image wrappers: direct AOSP, ChromeOS, DHTB
+  (size + SHA-256 checksum recomputed on repack), Tegra Blob
+- Pre-header wrappers: **NookHD** (0x4000), **Acclaim** (0x1000),
+  **Amonet** (microloader, 0x400) — preserved byte-for-byte on
+  repack
+- Section-level wrappers: **MTK** kernel / ramdisk header (512 B
+  preamble, size field patched on repack), **zImage** kernel
+  detection flag
 - Kernel + ramdisk sections, v4 signature section
+- v0 / v1 / v2 / PXA **`id` field** recomputed on repack with
+  the same hash algorithm the source used (SHA-1 or SHA-256,
+  auto-detected from the source id trailer)
+- **AVB1** (Android Verified Boot v1) `magiskboot sign` /
+  `magiskboot verify` — DER-encoded BootSignature tail written
+  at `tail_off`, signed with the bundled verity keypair (or a
+  user-supplied `x509.pem` + `pk8`)
 - AVB2 footer + vbmeta tail preserved byte-for-byte through
   unpack / repack
 
 **Deferred** (targeted follow-ups — not blocking the primary use
-case): vendor_boot v3/v4, legacy header versions v0/v1/v2 plus
-Samsung PXA, MTK / Nook / Acclaim / Amonet / Z4 / zImage kernel
-wrappers, SHA-1 / SHA-256 `id` field patching for v0–v2, AVB1
-signature block signing, DHTB SHA-256 wrapper checksum recompute.
+case): Z4 (lokiloader) wrapper.
 
 ## Architecture
 

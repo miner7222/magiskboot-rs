@@ -121,7 +121,8 @@ pub fn check_fmt(buf: &[u8]) -> FileFormat {
     }
 
     // BLOB (Tegra)
-    if buf.len() >= 16 && buf[..4] == [0x00, 0x00, 0x00, 0x00]
+    if buf.len() >= 16
+        && buf[..4] == [0x00, 0x00, 0x00, 0x00]
         && &buf[4..12] == b"\x00\x00\x00\x00\x00\x00\x00\x00"
     {
         // Heuristic: BLOB detection is complex, skip for now
@@ -220,10 +221,9 @@ pub fn split_image_dtb(filename: &str, skip_decomp: bool) -> i32 {
 // well-defined "unsupported" state rather than a panic.
 // ---------------------------------------------------------------------------
 
-use crate::bootimg::hdr::{
-    BootImgHdrV3, BootImgHdrV4, AVB1_SIGNATURE_MAGIC, BOOT_MAGIC,
-};
+use crate::bootimg::hdr::{BOOT_MAGIC, BootImgHdrV3, BootImgHdrV4};
 use crate::bootimg::unpack::sniff_outer_for_repack;
+use crate::sign::is_boot_signature;
 
 /// Parsed view of a boot image held in memory.
 pub struct BootImage {
@@ -259,9 +259,7 @@ impl BootImage {
         let (_flags, hdr_off) = sniff_outer_for_repack(&buf);
         let (payload_end, tail_end) = compute_ranges(&buf, hdr_off);
         let tail_range = (payload_end, tail_end);
-        let signed = tail_slice(&buf, tail_range)
-            .get(..AVB1_SIGNATURE_MAGIC.len())
-            .is_some_and(|m| m == AVB1_SIGNATURE_MAGIC);
+        let signed = is_boot_signature(tail_slice(&buf, tail_range));
 
         Box::new(BootImage {
             buf,
@@ -417,13 +415,15 @@ mod bootimage_tests {
     }
 
     #[test]
-    fn flags_avb1_signed_tail() {
+    fn flags_avb1_signed_tail_rejects_junk() {
+        // Random tail bytes must NOT be flagged as AVB1-signed — they
+        // won't DER-decode as a BootSignature sequence.
         let tmp = tempfile::tempdir().unwrap();
-        let img_bytes = build_v3(&b"K".repeat(5), &b"R".repeat(5), b"AVB\x00rest");
-        let img_path = tmp.path().join("signed.img");
+        let img_bytes = build_v3(&b"K".repeat(5), &b"R".repeat(5), b"not-a-der-signature");
+        let img_path = tmp.path().join("unsigned.img");
         std::fs::write(&img_path, &img_bytes).unwrap();
         let bi = BootImage::new(img_path.to_str().unwrap());
-        assert!(bi.is_signed());
+        assert!(!bi.is_signed());
     }
 
     #[test]

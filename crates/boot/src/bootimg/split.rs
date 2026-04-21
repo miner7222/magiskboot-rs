@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::ffi::{check_fmt, FileFormat};
+use crate::ffi::{FileFormat, check_fmt};
 
 /// Scan `buf` for a valid FDT header. Returns the byte offset of
 /// the first candidate whose `totalsize` / `off_dt_struct` fields
@@ -26,10 +26,7 @@ pub fn find_dtb_offset(buf: &[u8]) -> Option<usize> {
     let mut start = 0usize;
     while start + FDT_HEADER_SIZE <= buf.len() {
         // memmem for the 4-byte magic.
-        let Some(rel) = buf[start..]
-            .windows(4)
-            .position(|w| w == DTB_MAGIC)
-        else {
+        let Some(rel) = buf[start..].windows(4).position(|w| w == DTB_MAGIC) else {
             return None;
         };
         let pos = start + rel;
@@ -42,8 +39,7 @@ pub fn find_dtb_offset(buf: &[u8]) -> Option<usize> {
         let off_dt_struct = u32::from_be_bytes(h[8..12].try_into().unwrap());
         let remaining = (buf.len() - pos) as u64;
 
-        let ok_totalsize =
-            totalsize as u64 <= remaining && totalsize >= MIN_FDT_TOTALSIZE;
+        let ok_totalsize = totalsize as u64 <= remaining && totalsize >= MIN_FDT_TOTALSIZE;
         let ok_off_struct = (off_dt_struct as u64) <= remaining;
         if ok_totalsize && ok_off_struct {
             let node_off = pos + off_dt_struct as usize;
@@ -67,11 +63,7 @@ pub fn find_dtb_offset(buf: &[u8]) -> Option<usize> {
 ///
 /// Returns `Ok(0)` on success, `Ok(1)` when no DTB was found (same
 /// exit-code contract as upstream).
-pub fn split_image_dtb(
-    image_path: &Path,
-    out_dir: &Path,
-    skip_decomp: bool,
-) -> io::Result<i32> {
+pub fn split_image_dtb(image_path: &Path, out_dir: &Path, skip_decomp: bool) -> io::Result<i32> {
     let buf = std::fs::read(image_path)?;
     let Some(dtb_off) = find_dtb_offset(&buf) else {
         eprintln!("Cannot find DTB in {}", image_path.display());

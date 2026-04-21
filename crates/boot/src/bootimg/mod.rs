@@ -28,6 +28,6 @@ pub mod split;
 pub mod unpack;
 
 pub use hdr::*;
-pub use repack::{repack, RepackError};
+pub use repack::{RepackError, repack};
 pub use split::{find_dtb_offset, split_image_dtb};
-pub use unpack::{unpack, UnpackError, UnpackReport};
+pub use unpack::{UnpackError, UnpackReport, unpack};

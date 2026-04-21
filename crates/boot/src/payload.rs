@@ -36,9 +36,7 @@ pub fn extract_boot_from_payload(
         io::stdin().lock().read_to_end(&mut buf)?;
         Box::new(Cursor::new(buf))
     } else {
-        Box::new(
-            File::open(in_path).log_with_msg(|w| write!(w, "Cannot open '{in_path}'"))?,
-        )
+        Box::new(File::open(in_path).log_with_msg(|w| write!(w, "Cannot open '{in_path}'"))?)
     });
 
     let buf = &mut [0u8; 4];

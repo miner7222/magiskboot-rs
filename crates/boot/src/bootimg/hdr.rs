@@ -34,6 +34,10 @@ use bytemuck::{Pod, Zeroable};
 pub const BOOT_MAGIC_SIZE: usize = 8;
 pub const BOOT_NAME_SIZE: usize = 16;
 pub const BOOT_ID_SIZE: usize = 32;
+/// SHA-1 digest size in bytes (`sha1::OUTPUT_SIZE`).
+pub const SHA_DIGEST_SIZE: usize = 20;
+/// SHA-256 digest size in bytes.
+pub const SHA256_DIGEST_SIZE: usize = 32;
 pub const BOOT_ARGS_SIZE: usize = 512;
 pub const BOOT_EXTRA_ARGS_SIZE: usize = 1024;
 pub const VENDOR_BOOT_ARGS_SIZE: usize = 2048;
@@ -81,8 +85,6 @@ pub const ACCLAIM_PRE_HEADER_SZ: usize = 0x1000;
 /// AMONET microloader magic at boot-image offset 0.
 pub const AMONET_MICROLOADER_MAGIC: &[u8] = b"microloader";
 pub const AMONET_MICROLOADER_SZ: usize = 1024;
-/// AVB1 (Android Verified Boot, version 1) signature magic.
-pub const AVB1_SIGNATURE_MAGIC: &[u8] = b"AVB\x00";
 /// AVB2 footer + vbmeta magics.
 pub const AVB_FOOTER_MAGIC: &[u8] = b"AVBf";
 pub const AVB_MAGIC: &[u8] = b"AVB0";
@@ -390,6 +392,19 @@ pub enum BootFlag {
 
 /// Total number of boot flags — mirrors C++ `BOOT_FLAGS_MAX`.
 pub const BOOT_FLAGS_MAX: usize = 14;
+
+/// Examine the 32-byte `id` field from a v0/v1/v2/PXA header and
+/// return `true` if it holds a SHA-1 digest (bytes \[24..32) all zero)
+/// or `false` if it holds a SHA-256 digest (any non-zero byte in
+/// that tail). Mirrors the upstream `parse_image` detection heuristic.
+/// The +4 skip past `SHA_DIGEST_SIZE` gives leeway for garbage the
+/// original AOSP writer may have left between the 20-byte SHA-1 and
+/// the field end, matching the C++ source exactly.
+pub fn id_uses_sha1(id: &[u8; BOOT_ID_SIZE]) -> bool {
+    id[SHA_DIGEST_SIZE + 4..SHA256_DIGEST_SIZE]
+        .iter()
+        .all(|&b| b == 0)
+}
 
 // ---------------------------------------------------------------------------
 // Tests — hand-crafted byte blobs to pin down layout (size + field

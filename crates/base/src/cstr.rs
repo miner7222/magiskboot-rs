@@ -263,7 +263,9 @@ impl Utf8CStr {
     }
 
     pub fn file_name(&self) -> Option<&str> {
-        Path::new(self.as_str()).file_name().and_then(|s| s.to_str())
+        Path::new(self.as_str())
+            .file_name()
+            .and_then(|s| s.to_str())
     }
 
     pub fn exists(&self) -> bool {

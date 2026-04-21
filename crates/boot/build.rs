@@ -13,10 +13,5 @@ fn main() {
         &["."],
     )
     .unwrap();
-    FileDescriptor::run(
-        &cb.single_module(true)
-            .dont_use_cow(true)
-            .build(),
-    )
-    .unwrap();
+    FileDescriptor::run(&cb.single_module(true).dont_use_cow(true).build()).unwrap();
 }

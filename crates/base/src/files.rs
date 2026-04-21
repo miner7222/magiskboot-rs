@@ -140,7 +140,10 @@ impl Read for &FileOrStd {
         match self {
             FileOrStd::StdIn => io::stdin().lock().read(buf),
             FileOrStd::File(f) => (&*f).read(buf),
-            _ => Err(io::Error::new(io::ErrorKind::Other, "Cannot read from stdout/stderr")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Cannot read from stdout/stderr",
+            )),
         }
     }
 }
@@ -151,7 +154,10 @@ impl Write for &FileOrStd {
             FileOrStd::StdOut => io::stdout().lock().write(buf),
             FileOrStd::StdErr => io::stderr().lock().write(buf),
             FileOrStd::File(f) => (&*f).write(buf),
-            FileOrStd::StdIn => Err(io::Error::new(io::ErrorKind::Other, "Cannot write to stdin")),
+            FileOrStd::StdIn => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Cannot write to stdin",
+            )),
         }
     }
 
@@ -182,7 +188,11 @@ impl MappedFile {
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         let ptr = mmap.as_ptr();
         let len = mmap.len();
-        Ok(MappedFile { _mmap: mmap, ptr, len })
+        Ok(MappedFile {
+            _mmap: mmap,
+            ptr,
+            len,
+        })
     }
 }
 

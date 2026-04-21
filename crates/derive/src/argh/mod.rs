@@ -325,8 +325,12 @@ fn impl_from_args_struct_from_args<'a>(
     let flag_output_table = fields.iter().filter_map(|field| {
         let field_name = &field.field.ident;
         match field.kind {
-            FieldKind::Option => Some(quote! { crate::argh::ParseStructOption::Value(&mut #field_name) }),
-            FieldKind::Switch => Some(quote! { crate::argh::ParseStructOption::Flag(&mut #field_name) }),
+            FieldKind::Option => {
+                Some(quote! { crate::argh::ParseStructOption::Value(&mut #field_name) })
+            }
+            FieldKind::Switch => {
+                Some(quote! { crate::argh::ParseStructOption::Flag(&mut #field_name) })
+            }
             FieldKind::SubCommand | FieldKind::Positional => None,
         }
     });
