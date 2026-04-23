@@ -15,11 +15,11 @@ base = { path = "../base" }
 # Boot-image pipeline is pure Rust — no C++ linkage required.
 # Compression
 flate2 = { version = "1", features = ["zlib-rs"] }
-bzip2 = "0.5"
+bzip2 = "0.6"
 lz4 = "1"
 lzma-rust2 = "0.16"
 zopfli = { version = "0.8", features = ["gzip"] }
-# Crypto — use 0.10 series for digest compatibility
+# Crypto
 sha1 = "0.10"
 sha2 = "0.10"
 digest = { version = "0.10", features = ["std"] }
