@@ -65,6 +65,80 @@ Supported actions:
 }
 
 const MAX_PRINT_LEN: usize = 32;
+const DTB_MAGIC: &[u8] = b"\xd0\x0d\xfe\xed";
+const FDT_HEADER_SIZE: usize = 40;
+
+// Size of the flattened device tree produced by Linux's empty_root.dts.
+// A candidate this small contains no useful device-tree data.
+const MIN_NON_EMPTY_DTB_SIZE: usize = 0x84;
+
+fn read_be_u32(buf: &[u8], offset: usize) -> Option<usize> {
+    let bytes = buf.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_be_bytes(bytes) as usize)
+}
+
+fn range_within(total: usize, offset: usize, size: usize) -> bool {
+    offset
+        .checked_add(size)
+        .is_some_and(|end| offset <= total && end <= total)
+}
+
+fn is_valid_dtb_candidate(buf: &[u8]) -> bool {
+    let Some(total_size) = read_be_u32(buf, 4) else {
+        return false;
+    };
+    if total_size <= MIN_NON_EMPTY_DTB_SIZE || total_size > buf.len() {
+        return false;
+    }
+
+    let Some(struct_offset) = read_be_u32(buf, 8) else {
+        return false;
+    };
+    let Some(strings_offset) = read_be_u32(buf, 12) else {
+        return false;
+    };
+    let Some(reserve_offset) = read_be_u32(buf, 16) else {
+        return false;
+    };
+    let Some(strings_size) = read_be_u32(buf, 32) else {
+        return false;
+    };
+    let Some(struct_size) = read_be_u32(buf, 36) else {
+        return false;
+    };
+
+    if !range_within(total_size, struct_offset, struct_size)
+        || !range_within(total_size, strings_offset, strings_size)
+        || !range_within(total_size, reserve_offset, 16)
+        || struct_size < 8
+    {
+        return false;
+    }
+
+    // fdt 0.1.5 already supports unaligned byte slices, but its node parser
+    // is infallible. Validate every range it indexes before asking it to
+    // resolve the root node, which gives the v31 fallible-parse semantics
+    // without a dependency upgrade.
+    let Ok(fdt) = Fdt::new(&buf[..total_size]) else {
+        return false;
+    };
+    fdt.find_node("/").is_some()
+}
+
+/// Return the first non-empty, parseable flattened-device-tree offset.
+/// Malformed magic lookalikes are skipped so a later valid DTB can win.
+pub fn find_dtb_offset(buf: &[u8]) -> Option<usize> {
+    let mut pos = 0;
+    while pos + FDT_HEADER_SIZE <= buf.len() {
+        let rel_pos = buf[pos..].windows(4).position(|w| w == DTB_MAGIC)?;
+        let curr = pos + rel_pos;
+        if is_valid_dtb_candidate(&buf[curr..]) {
+            return Some(curr);
+        }
+        pos = curr + 4;
+    }
+    None
+}
 
 fn print_node(node: &FdtNode) {
     fn pretty_node(depth_set: &[bool]) {
@@ -164,7 +238,7 @@ fn for_each_fdt<F: FnMut(usize, Fdt) -> LoggedResult<()>>(
     let mut buf = Some(file.as_ref());
     let mut dtb_num = 0usize;
     while let Some(slice) = buf {
-        let slice = if let Some(pos) = slice.windows(4).position(|w| w == b"\xd0\x0d\xfe\xed") {
+        let slice = if let Some(pos) = find_dtb_offset(slice) {
             &slice[pos..]
         } else {
             break;
@@ -243,16 +317,13 @@ fn dtb_patch(file: &Utf8CStr) -> LoggedResult<bool> {
                 continue;
             }
             if let Some(boot_args) = node.property("bootargs") {
-                boot_args.value.windows(14).for_each(|w| {
-                    if w == b"skip_initramfs" {
-                        let w = unsafe {
-                            &mut *std::mem::transmute::<&[u8], &UnsafeCell<[u8]>>(w).get()
-                        };
-                        w[..=4].copy_from_slice(b"want");
-                        eprintln!("Patch [skip_initramfs] -> [want_initramfs] in dtb.{n:04}");
-                        patched = true;
-                    }
-                });
+                let boot_args = unsafe {
+                    &mut *std::mem::transmute::<&[u8], &UnsafeCell<[u8]>>(boot_args.value).get()
+                };
+                for _ in 0..patch_skip_initramfs(boot_args) {
+                    eprintln!("Patch [skip_initramfs] -> [want_initramfs] in dtb.{n:04}");
+                    patched = true;
+                }
             }
         }
         if keep_verity {
@@ -275,6 +346,22 @@ fn dtb_patch(file: &Utf8CStr) -> LoggedResult<bool> {
     Ok(patched)
 }
 
+fn patch_skip_initramfs(buf: &mut [u8]) -> usize {
+    const FROM: &[u8] = b"skip_initramfs";
+    let mut count = 0;
+    let mut offset = 0;
+    while offset + FROM.len() <= buf.len() {
+        if &buf[offset..offset + FROM.len()] == FROM {
+            buf[offset..offset + 4].copy_from_slice(b"want");
+            count += 1;
+            offset += FROM.len();
+        } else {
+            offset += 1;
+        }
+    }
+    count
+}
+
 pub(crate) fn dtb_commands(file: &Utf8CStr, action: &DtbAction) -> LoggedResult<bool> {
     match action {
         DtbAction::Print(Print { fstab }) => {
@@ -283,5 +370,57 @@ pub(crate) fn dtb_commands(file: &Utf8CStr, action: &DtbAction) -> LoggedResult<
         }
         DtbAction::Test(_) => Ok(dtb_test(file)?),
         DtbAction::Patch(_) => Ok(dtb_patch(file)?),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_dtb(total_size: usize) -> Vec<u8> {
+        const STRUCT_OFFSET: usize = 0x38;
+        const STRUCT_SIZE: usize = 16;
+        const STRINGS_OFFSET: usize = STRUCT_OFFSET + STRUCT_SIZE;
+
+        let mut out = vec![0u8; total_size];
+        out[0..4].copy_from_slice(DTB_MAGIC);
+        out[4..8].copy_from_slice(&(total_size as u32).to_be_bytes());
+        out[8..12].copy_from_slice(&(STRUCT_OFFSET as u32).to_be_bytes());
+        out[12..16].copy_from_slice(&(STRINGS_OFFSET as u32).to_be_bytes());
+        out[16..20].copy_from_slice(&0x28u32.to_be_bytes());
+        out[20..24].copy_from_slice(&17u32.to_be_bytes());
+        out[24..28].copy_from_slice(&16u32.to_be_bytes());
+        out[32..36].copy_from_slice(&0u32.to_be_bytes());
+        out[36..40].copy_from_slice(&(STRUCT_SIZE as u32).to_be_bytes());
+        out[STRUCT_OFFSET..STRUCT_OFFSET + 4].copy_from_slice(&1u32.to_be_bytes());
+        out[STRUCT_OFFSET + 8..STRUCT_OFFSET + 12].copy_from_slice(&2u32.to_be_bytes());
+        out[STRUCT_OFFSET + 12..STRUCT_OFFSET + 16].copy_from_slice(&9u32.to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn find_dtb_skips_malformed_candidate_before_valid_one() {
+        let mut buf = b"kernel".to_vec();
+        buf.extend_from_slice(DTB_MAGIC);
+        buf.extend_from_slice(&[0u8; FDT_HEADER_SIZE]);
+        let expected = buf.len();
+        buf.extend_from_slice(&valid_dtb(0x100));
+        assert_eq!(find_dtb_offset(&buf), Some(expected));
+    }
+
+    #[test]
+    fn find_dtb_rejects_empty_and_truncated_candidates() {
+        assert_eq!(find_dtb_offset(&valid_dtb(MIN_NON_EMPTY_DTB_SIZE)), None);
+
+        let mut truncated = valid_dtb(0x100);
+        truncated.truncate(0x80);
+        assert_eq!(find_dtb_offset(&truncated), None);
+    }
+
+    #[test]
+    fn skip_initramfs_patch_has_equal_slice_lengths() {
+        let mut args = *b"console=ttyS0 skip_initramfs rootwait";
+        assert_eq!(patch_skip_initramfs(&mut args), 1);
+        assert_eq!(&args, b"console=ttyS0 want_initramfs rootwait");
     }
 }

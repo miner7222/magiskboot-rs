@@ -52,6 +52,7 @@ pub const VENDOR_RAMDISK_TYPE_DLKM: u32 = 3;
 pub const AVB_FOOTER_MAGIC_LEN: usize = 4;
 pub const AVB_MAGIC_LEN: usize = 4;
 pub const AVB_RELEASE_STRING_SIZE: usize = 48;
+pub const AVB_DESCRIPTOR_TAG_HASH: u64 = 2;
 
 // ---------------------------------------------------------------------------
 // Magic byte sequences. Kept as `&[u8]` rather than `&str` so callers
@@ -190,6 +191,29 @@ pub struct AvbFooter {
     pub vbmeta_offset: u64,
     pub vbmeta_size: u64,
     pub reserved: [u8; 28],
+}
+
+/// Common header shared by every AVB descriptor.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct AvbDescriptor {
+    pub tag: u64,
+    pub num_bytes_following: u64,
+}
+
+/// Fixed portion of an AVB hash descriptor. Variable partition-name, salt,
+/// and digest bytes follow this header.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct AvbHashDescriptor {
+    pub header: AvbDescriptor,
+    pub image_size: u64,
+    pub hash_algorithm: [u8; 32],
+    pub partition_name_len: u32,
+    pub salt_len: u32,
+    pub digest_len: u32,
+    pub flags: u32,
+    pub reserved: [u8; 60],
 }
 
 /// AVB vbmeta header. Matches
@@ -437,6 +461,8 @@ mod tests {
     fn sizes_avb_headers() {
         // AvbFooter: 4 + 4 + 4 + 8 + 8 + 8 + 28 = 64
         assert_eq!(size_of::<AvbFooter>(), 64);
+        assert_eq!(size_of::<AvbDescriptor>(), 16);
+        assert_eq!(size_of::<AvbHashDescriptor>(), 132);
         // AvbVBMetaImageHeader: 4 + 4+4 + 8+8 + 4 + 8*10 + 4+4 + 48 + 80 = 256
         assert_eq!(size_of::<AvbVBMetaImageHeader>(), 256);
     }

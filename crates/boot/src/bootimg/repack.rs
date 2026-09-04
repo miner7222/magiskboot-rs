@@ -7,7 +7,6 @@
 //! - vendor_boot v3 / v4
 //! - legacy v0 / v1 / v2 + Samsung PXA
 //! - MTK / Nook / Acclaim / Amonet / Z4 wrappers
-//! - zImage kernel carve + zopfli recompression for kernel
 //! - SHA-1 / SHA-256 `id` field patch (v0..v2 only)
 //! - AVB1 signature block (`AVB\0` trailer)
 //! - DHTB wrapper SHA-256 checksum + Blob size recomputation when
@@ -25,12 +24,10 @@
 //!   page boundary *measured from the AOSP header start* — this
 //!   matches C++ `file_align()` = `align_padding(lseek - off.header,
 //!   page_size)`.
-//! - Tail bytes past the last known section (AVB2 footer + vbmeta +
-//!   zero pad that Lenovo firmware appends) are copied verbatim from
-//!   source. This keeps AVB2 offsets valid when the repacked AOSP
-//!   image length matches the source — the common case for a Magisk
-//!   patch where ramdisk size changes by < 4 KiB and compression
-//!   still lands in the same page.
+//! - An AVB2 vbmeta block is re-emitted after the rebuilt AOSP image.
+//!   Footer offsets and the first hash descriptor's `image_size` are
+//!   synchronized with the new payload boundary, and the original
+//!   partition length is retained when it still has enough space.
 //! - Output is padded to the source file's length (same as C++
 //!   `write_zero(fd, boot.map.size() - current)`).
 //!
@@ -52,16 +49,20 @@ use std::path::Path;
 use bytemuck::Pod;
 
 use crate::bootimg::hdr::{
-    BLOB_MAGIC, BOOT_ID_SIZE, BOOT_MAGIC, BootFlag, BootImgHdrPxa, BootImgHdrV0, BootImgHdrV1,
-    BootImgHdrV2, BootImgHdrV3, BootImgHdrV4, BootImgHdrVndV3, BootImgHdrVndV4, CHROMEOS_MAGIC,
-    DHTB_MAGIC, MTK_MAGIC, MtkHdr, SHA256_DIGEST_SIZE, SHA_DIGEST_SIZE, VENDOR_BOOT_MAGIC,
-    VendorRamdiskTableEntryV4, align_padding, align_to, id_uses_sha1,
+    AVB_DESCRIPTOR_TAG_HASH, AVB_FOOTER_MAGIC, AVB_MAGIC, AvbDescriptor, AvbFooter,
+    AvbHashDescriptor, AvbVBMetaImageHeader, BLOB_MAGIC, BOOT_ID_SIZE, BOOT_MAGIC, BootFlag,
+    BootImgHdrPxa, BootImgHdrV0, BootImgHdrV1, BootImgHdrV2, BootImgHdrV3, BootImgHdrV4,
+    BootImgHdrVndV3, BootImgHdrVndV4, CHROMEOS_MAGIC, DHTB_MAGIC, MTK_MAGIC, MtkHdr,
+    SHA_DIGEST_SIZE, SHA256_DIGEST_SIZE, VENDOR_BOOT_MAGIC, VendorRamdiskTableEntryV4,
+    align_padding, align_to, id_uses_sha1,
 };
+use crate::bootimg::unpack::{VND_RAMDISK_DIR, VND_RAMDISK_TABLE_FILE};
+use crate::ffi::FileFormat;
+use crate::format::check_fmt;
+use crate::zimage::ZImage;
 use digest::Digest;
 use sha1::Sha1;
 use sha2::Sha256;
-use crate::bootimg::unpack::{VND_RAMDISK_DIR, VND_RAMDISK_TABLE_FILE};
-use crate::ffi::{FileFormat, check_fmt};
 
 /// Errors the repack path can surface. Mirrors
 /// `UnpackError` plus the write-side failure modes.
@@ -212,32 +213,17 @@ fn repack_v3(
     new_hdr.ramdisk_size = new_ramdisk_size as u32;
     pad_to(&mut out, out_hdr_off, PAGE);
 
-    // 5. Deliberately drop the source tail (AVB footer + vbmeta +
-    //    zero padding). Copying it verbatim caused a nasty
-    //    truncation bug: when the replacement kernel / ramdisk
-    //    grew past the original section end, the appended source
-    //    tail carried a stale `AvbFooter.original_image_size`
-    //    pointing at the *old* section end. A downstream `avbtool
-    //    erase_footer` call read that value and truncated the new
-    //    file back to the old size, amputating the replacement
-    //    payload and producing a non-booting image.
-    //
-    //    The downstream root pipeline always follows this repack with
-    //    `erase_footer + add_hash_footer`, so the AVB layout is
-    //    rebuilt from scratch anyway — re-emitting the source tail
-    //    is not needed for correctness and actively hurts when
-    //    section sizes change. Standalone CLI usage that expects a
-    //    drop-in-replacement signed image is deferred to a follow-up
-    //    (would require porting the C++ `patch AvbFooter` step).
-
-    // 6. Patch header in place with the rewritten sizes.
+    // 5. Patch header in place with the rewritten sizes.
     patch_v3_header(
         &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV3>()],
         &new_hdr,
     );
 
-    // 7. Patch outer wrapper size fields.
+    // 6. Patch outer wrapper size fields.
     patch_outer_wrapper(&mut out, out_hdr_off, src_tail_off_rel);
+
+    // 7. Rebuild AVB2 tail and synchronize descriptor sizes.
+    rebuild_avb_tail(src, &mut out, out_hdr_off);
 
     write_file(out_img, &out)
 }
@@ -318,17 +304,13 @@ fn repack_v4(
         pad_to(&mut out, out_hdr_off, PAGE);
     }
 
-    // Source-tail copy intentionally omitted — see `repack_v3` for
-    // the rationale. Downstream tooling rebuilds AVB with its own
-    // `avbtool` invocation after repack, so reusing the stale source
-    // footer would corrupt the new image when section sizes grow.
-
     patch_v4_header(
         &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV4>()],
         &new_hdr,
     );
 
     patch_outer_wrapper(&mut out, out_hdr_off, src_tail_off_rel);
+    rebuild_avb_tail(src, &mut out, out_hdr_off);
 
     write_file(out_img, &out)
 }
@@ -521,6 +503,7 @@ fn repack_v0(
 
     let hdr_slot = &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV0>()];
     hdr_slot.copy_from_slice(bytemuck::bytes_of(&new_hdr));
+    rebuild_avb_tail(src, &mut out, out_hdr_off);
     write_file(out_img, &out)
 }
 
@@ -588,6 +571,7 @@ fn repack_v1(
 
     let hdr_slot = &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV1>()];
     hdr_slot.copy_from_slice(bytemuck::bytes_of(&new_hdr));
+    rebuild_avb_tail(src, &mut out, out_hdr_off);
     write_file(out_img, &out)
 }
 
@@ -660,6 +644,7 @@ fn repack_v2(
     let hdr_slot = &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV2>()];
     hdr_slot.copy_from_slice(bytemuck::bytes_of(&new_hdr));
     let _ = legacy_offsets(&lay);
+    rebuild_avb_tail(src, &mut out, out_hdr_off);
     write_file(out_img, &out)
 }
 
@@ -725,6 +710,7 @@ fn repack_pxa(
 
     let hdr_slot = &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrPxa>()];
     hdr_slot.copy_from_slice(bytemuck::bytes_of(&new_hdr));
+    rebuild_avb_tail(src, &mut out, out_hdr_off);
     write_file(out_img, &out)
 }
 
@@ -802,6 +788,7 @@ fn repack_vendor_v3(
     let hdr_slot = &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrVndV3>()];
     hdr_slot.copy_from_slice(bytemuck::bytes_of(&new_hdr));
 
+    rebuild_avb_tail(src, &mut out, out_hdr_off);
     write_file(out_img, &out)
 }
 
@@ -969,6 +956,7 @@ fn repack_vendor_v4(
     let hdr_slot = &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrVndV4>()];
     hdr_slot.copy_from_slice(bytemuck::bytes_of(&new_hdr));
 
+    rebuild_avb_tail(src, &mut out, out_hdr_off);
     write_file(out_img, &out)
 }
 
@@ -1038,24 +1026,102 @@ fn write_section(
     // new payload, then patch the MtkHdr.size field to match the new
     // payload size — same logic as the upstream C++ `boot_img` path.
     let (src_mtk_hdr, src_inner) = split_mtk(src_section);
+    let is_primary_kernel = matches!(policy, SectionPolicy::Kernel)
+        && work_file.file_name().is_some_and(|name| name == "kernel");
+    let (src_payload, src_kernel_dtb) = if is_primary_kernel {
+        if let Some(offset) = crate::dtb::find_dtb_offset(src_inner) {
+            (&src_inner[..offset], Some(&src_inner[offset..]))
+        } else {
+            (src_inner, None)
+        }
+    } else {
+        (src_inner, None)
+    };
+
+    let zimage = if is_primary_kernel {
+        ZImage::parse(src_payload)
+    } else {
+        None
+    };
+
+    let section_start = out.len();
+    if let Some(mtk_header) = src_mtk_hdr {
+        out.extend_from_slice(mtk_header);
+    }
+    let payload_size = if let Some(zimage) = zimage {
+        write_zimage(out, &zimage, work_file, policy, hv, skip_comp)?
+    } else {
+        write_section_payload(out, src_payload, work_file, policy, hv, skip_comp)?
+    };
+    let dtb_file = work_file
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("kernel_dtb");
+    let dtb_size = if is_primary_kernel && dtb_file.exists() {
+        write_raw_section(out, src_kernel_dtb.unwrap_or_default(), &dtb_file)?
+    } else if let Some(src_dtb) = src_kernel_dtb {
+        write_raw_section(out, src_dtb, &dtb_file)?
+    } else {
+        0
+    };
+    let inner_size = payload_size + dtb_size;
+
     if src_mtk_hdr.is_some() {
-        let before = out.len();
-        out.extend_from_slice(src_mtk_hdr.unwrap());
-        let payload_size = write_section_payload(
-            out,
-            src_inner,
-            work_file,
-            policy,
-            hv,
-            skip_comp,
-        )?;
-        // Patch MtkHdr.size (bytes 4..8 LE) to the new payload size.
-        let size_off = before + 4;
-        out[size_off..size_off + 4].copy_from_slice(&(payload_size as u32).to_le_bytes());
-        return Ok(size_of::<MtkHdr>() + payload_size);
+        // Patch MtkHdr.size (bytes 4..8 LE) to cover the kernel payload and
+        // its appended DTB, but not the MTK header itself.
+        let size_off = section_start + 4;
+        out[size_off..size_off + 4].copy_from_slice(&(inner_size as u32).to_le_bytes());
+    }
+    Ok(out.len() - section_start)
+}
+
+/// Emit a parsed zImage wrapper around the work-dir kernel. The original head
+/// is used as a same-sized placeholder until the new piggy size is known, then
+/// replaced with its relocated form.
+fn write_zimage(
+    out: &mut Vec<u8>,
+    zimage: &ZImage<'_>,
+    work_file: &Path,
+    policy: SectionPolicy,
+    hv: HeaderVersion,
+    skip_comp: bool,
+) -> Result<usize, RepackError> {
+    let section_start = out.len();
+    if !work_file.exists() {
+        out.extend_from_slice(zimage.head);
+        out.extend_from_slice(zimage.piggy);
+        out.extend_from_slice(zimage.tail);
+        return Ok(out.len() - section_start);
     }
 
-    write_section_payload(out, src_section, work_file, policy, hv, skip_comp)
+    out.extend_from_slice(zimage.head);
+    let piggy_start = out.len();
+    let original_payload = if zimage.fmt == FileFormat::GZIP {
+        zimage.piggy
+    } else {
+        &zimage.piggy[..zimage.piggy.len() - size_of::<u32>()]
+    };
+
+    let work_bytes = std::fs::read(work_file)?;
+    let work_fmt = check_fmt(&work_bytes);
+    let recompresses_raw = !skip_comp
+        && !work_fmt.is_compressed()
+        && !matches!(work_fmt, FileFormat::LZOP)
+        && zimage.fmt.is_compressed();
+
+    write_section_payload(out, original_payload, work_file, policy, hv, skip_comp)?;
+    if recompresses_raw && zimage.fmt != FileFormat::GZIP {
+        let uncompressed_size = u32::try_from(work_bytes.len())
+            .map_err(|_| RepackError::Compress("zImage kernel exceeds u32 size".into()))?;
+        out.extend_from_slice(&uncompressed_size.to_le_bytes());
+    }
+
+    let piggy_size = out.len() - piggy_start;
+    let tail = zimage.new_tail(piggy_size);
+    out.extend_from_slice(&tail);
+    let head = zimage.new_head(piggy_size);
+    out[section_start..section_start + head.len()].copy_from_slice(&head);
+    Ok(out.len() - section_start)
 }
 
 /// Split off a leading MTK wrapper header from a section if present.
@@ -1065,7 +1131,10 @@ fn split_mtk(src: &[u8]) -> (Option<&[u8]>, &[u8]) {
     if src.len() >= size_of::<MtkHdr>() {
         let magic = u32::from_le_bytes(src[..4].try_into().unwrap());
         if magic == MTK_MAGIC {
-            return (Some(&src[..size_of::<MtkHdr>()]), &src[size_of::<MtkHdr>()..]);
+            return (
+                Some(&src[..size_of::<MtkHdr>()]),
+                &src[size_of::<MtkHdr>()..],
+            );
         }
     }
     (None, src)
@@ -1318,6 +1387,151 @@ fn patch_outer_wrapper(out: &mut Vec<u8>, out_hdr_off: usize, src_tail_off_rel: 
     let _ = BootFlag::ChromeOs;
 }
 
+fn read_be_u64(buf: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_be_bytes(
+        buf.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
+fn patch_avb_hash_descriptor(
+    out: &mut [u8],
+    vbmeta_offset: usize,
+    vbmeta_size: usize,
+    image_size: u64,
+) {
+    let Some(vbmeta_end) = vbmeta_offset.checked_add(vbmeta_size) else {
+        return;
+    };
+    if vbmeta_size < size_of::<AvbVBMetaImageHeader>() || vbmeta_end > out.len() {
+        return;
+    }
+
+    let Some(auth_size) =
+        read_be_u64(out, vbmeta_offset + 12).and_then(|v| usize::try_from(v).ok())
+    else {
+        return;
+    };
+    let Some(descriptors_offset) =
+        read_be_u64(out, vbmeta_offset + 96).and_then(|v| usize::try_from(v).ok())
+    else {
+        return;
+    };
+    let Some(descriptors_size) =
+        read_be_u64(out, vbmeta_offset + 104).and_then(|v| usize::try_from(v).ok())
+    else {
+        return;
+    };
+    let Some(descriptors_start) = vbmeta_offset
+        .checked_add(size_of::<AvbVBMetaImageHeader>())
+        .and_then(|v| v.checked_add(auth_size))
+        .and_then(|v| v.checked_add(descriptors_offset))
+    else {
+        return;
+    };
+    let Some(descriptors_end) = descriptors_start.checked_add(descriptors_size) else {
+        return;
+    };
+    if descriptors_end > vbmeta_end {
+        eprintln!("AVB descriptors overflow vbmeta buffer");
+        return;
+    }
+
+    let mut descriptor = descriptors_start;
+    while descriptor < descriptors_end {
+        let remaining = descriptors_end - descriptor;
+        if remaining < size_of::<AvbDescriptor>() {
+            eprintln!("AVB descriptor header overflows descriptor buffer");
+            break;
+        }
+        let Some(tag) = read_be_u64(out, descriptor) else {
+            break;
+        };
+        let Some(following) =
+            read_be_u64(out, descriptor + 8).and_then(|v| usize::try_from(v).ok())
+        else {
+            break;
+        };
+        if following % 8 != 0 {
+            eprintln!("AVB descriptor length is not 8-byte aligned");
+            break;
+        }
+        let Some(next) = descriptor
+            .checked_add(size_of::<AvbDescriptor>())
+            .and_then(|v| v.checked_add(following))
+        else {
+            break;
+        };
+        if next > descriptors_end {
+            eprintln!("AVB descriptor length overflows descriptor buffer");
+            break;
+        }
+
+        if tag == AVB_DESCRIPTOR_TAG_HASH {
+            let min_body = size_of::<AvbHashDescriptor>() - size_of::<AvbDescriptor>();
+            if following < min_body {
+                eprintln!("AVB descriptor is too small to hold a hash descriptor");
+                break;
+            }
+            let image_size_offset = descriptor + size_of::<AvbDescriptor>();
+            out[image_size_offset..image_size_offset + 8]
+                .copy_from_slice(&image_size.to_be_bytes());
+            break;
+        }
+        descriptor = next;
+    }
+}
+
+/// Re-emit an AVB2 vbmeta block at the repacked AOSP boundary, preserve the
+/// original partition length, and patch every offset/size that depends on the
+/// rebuilt payload. Invalid footer metadata is ignored, matching upstream's
+/// behavior when no usable AVB footer was discovered during parsing.
+fn rebuild_avb_tail(src: &[u8], out: &mut Vec<u8>, header_offset: usize) {
+    let footer_size = size_of::<AvbFooter>();
+    let Some(src_footer_offset) = src.len().checked_sub(footer_size) else {
+        return;
+    };
+    let src_footer = &src[src_footer_offset..];
+    if !src_footer.starts_with(AVB_FOOTER_MAGIC) {
+        return;
+    }
+
+    let Some(src_vbmeta_offset) = read_be_u64(src_footer, 20).and_then(|v| usize::try_from(v).ok())
+    else {
+        return;
+    };
+    let Some(vbmeta_size) = read_be_u64(src_footer, 28).and_then(|v| usize::try_from(v).ok())
+    else {
+        return;
+    };
+    let Some(src_vbmeta_end) = src_vbmeta_offset.checked_add(vbmeta_size) else {
+        return;
+    };
+    if src_vbmeta_end > src_footer_offset
+        || vbmeta_size < size_of::<AvbVBMetaImageHeader>()
+        || !src[src_vbmeta_offset..src_vbmeta_end].starts_with(AVB_MAGIC)
+    {
+        return;
+    }
+
+    let Some(aosp_image_size) = out.len().checked_sub(header_offset) else {
+        return;
+    };
+    let vbmeta_offset = align_to(out.len() as u64, 4096) as usize;
+    out.resize(vbmeta_offset, 0);
+    out.extend_from_slice(&src[src_vbmeta_offset..src_vbmeta_end]);
+
+    let minimum_size = out.len().saturating_add(footer_size);
+    out.resize(src.len().max(minimum_size), 0);
+    let footer_offset = out.len() - footer_size;
+    out[footer_offset..].copy_from_slice(src_footer);
+    out[footer_offset + 12..footer_offset + 20]
+        .copy_from_slice(&(aosp_image_size as u64).to_be_bytes());
+    out[footer_offset + 20..footer_offset + 28]
+        .copy_from_slice(&(vbmeta_offset as u64).to_be_bytes());
+
+    patch_avb_hash_descriptor(out, vbmeta_offset, vbmeta_size, aosp_image_size as u64);
+}
+
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), RepackError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -1338,6 +1552,109 @@ mod tests {
     use super::*;
     use crate::bootimg::hdr::{BOOT_MAGIC, BootImgHdrV3, BootImgHdrV4};
     use crate::bootimg::unpack::unpack;
+
+    fn put_u32(buf: &mut [u8], offset: usize, value: u32) {
+        buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn synthetic_zimage(fmt: FileFormat) -> Vec<u8> {
+        const START: u32 = 0x8000;
+        const HEAD: usize = 0x100;
+        const PIGGY: usize = 0x20;
+        const PIGGY_END: usize = HEAD + PIGGY;
+        const TOTAL: usize = 0x140;
+        const TABLE: usize = 0x60;
+
+        let mut image = vec![0u8; TOTAL];
+        put_u32(&mut image, 0x24, 0x016f_2818);
+        put_u32(&mut image, 0x28, START);
+        put_u32(&mut image, 0x2c, START + TOTAL as u32);
+        put_u32(&mut image, 0x34, 0x4545_4545);
+        put_u32(&mut image, 0x38, TABLE as u32);
+        put_u32(&mut image, TABLE, 3);
+        put_u32(&mut image, TABLE + 4, 0x5a53_4c4b);
+        put_u32(&mut image, TABLE + 8, START + PIGGY_END as u32 - 4);
+        match fmt {
+            FileFormat::GZIP => image[HEAD..HEAD + 2].copy_from_slice(b"\x1f\x8b"),
+            FileFormat::XZ => {
+                image[HEAD..HEAD + 5].copy_from_slice(b"\xfd7zXZ");
+                put_u32(&mut image, PIGGY_END - 4, 0x1122_3344);
+            }
+            _ => panic!("unsupported synthetic format"),
+        }
+        image[PIGGY_END..].fill(0x5a);
+        image
+    }
+
+    fn compress_for_test(fmt: FileFormat, raw: &[u8]) -> Vec<u8> {
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = crate::compress::get_encoder(fmt, &mut compressed).unwrap();
+            encoder.write_all(raw).unwrap();
+            encoder.finish().unwrap();
+        }
+        compressed
+    }
+
+    #[test]
+    fn zimage_repack_restores_non_gzip_size_word() {
+        let source = synthetic_zimage(FileFormat::XZ);
+        let zimage = ZImage::parse(&source).expect("synthetic zImage");
+        let raw = b"synthetic uncompressed ARM kernel payload";
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = tmp.path().join("kernel");
+        std::fs::write(&kernel, raw).unwrap();
+
+        let mut out = Vec::new();
+        write_zimage(
+            &mut out,
+            &zimage,
+            &kernel,
+            SectionPolicy::Kernel,
+            header_version_v3(),
+            false,
+        )
+        .unwrap();
+
+        let compressed = compress_for_test(FileFormat::XZ, raw);
+        let payload_start = zimage.head.len();
+        assert_eq!(
+            &out[payload_start..payload_start + compressed.len()],
+            compressed
+        );
+        assert_eq!(
+            &out[payload_start + compressed.len()..payload_start + compressed.len() + 4],
+            &(raw.len() as u32).to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn zimage_repack_does_not_append_size_word_to_gzip() {
+        let source = synthetic_zimage(FileFormat::GZIP);
+        let zimage = ZImage::parse(&source).expect("synthetic zImage");
+        let raw = b"synthetic uncompressed ARM kernel payload";
+        let tmp = tempfile::tempdir().unwrap();
+        let kernel = tmp.path().join("kernel");
+        std::fs::write(&kernel, raw).unwrap();
+
+        let mut out = Vec::new();
+        write_zimage(
+            &mut out,
+            &zimage,
+            &kernel,
+            SectionPolicy::Kernel,
+            header_version_v3(),
+            false,
+        )
+        .unwrap();
+
+        let compressed = compress_for_test(FileFormat::GZIP, raw);
+        let payload_len = compressed.len();
+        let expected_tail = zimage.new_tail(payload_len);
+        let payload_start = zimage.head.len();
+        assert_eq!(&out[payload_start..payload_start + payload_len], compressed);
+        assert_eq!(&out[payload_start + payload_len..], expected_tail);
+    }
 
     fn build_v3_image(kernel: &[u8], ramdisk: &[u8], tail: &[u8]) -> Vec<u8> {
         const PAGE: usize = 4096;
@@ -1406,6 +1723,52 @@ mod tests {
         }
         out.extend_from_slice(tail);
         out
+    }
+
+    fn build_avb_image(aosp_size: usize, partition_size: usize) -> Vec<u8> {
+        const VBMETA_SIZE: usize = 256 + 136;
+        let mut out = vec![0u8; partition_size];
+        let vbmeta_offset = aosp_size;
+        out[vbmeta_offset..vbmeta_offset + 4].copy_from_slice(AVB_MAGIC);
+        out[vbmeta_offset + 20..vbmeta_offset + 28].copy_from_slice(&136u64.to_be_bytes());
+        out[vbmeta_offset + 104..vbmeta_offset + 112].copy_from_slice(&136u64.to_be_bytes());
+
+        let descriptor = vbmeta_offset + size_of::<AvbVBMetaImageHeader>();
+        out[descriptor..descriptor + 8].copy_from_slice(&AVB_DESCRIPTOR_TAG_HASH.to_be_bytes());
+        out[descriptor + 8..descriptor + 16].copy_from_slice(&120u64.to_be_bytes());
+        out[descriptor + 16..descriptor + 24].copy_from_slice(&(aosp_size as u64).to_be_bytes());
+
+        let footer = partition_size - size_of::<AvbFooter>();
+        out[footer..footer + 4].copy_from_slice(AVB_FOOTER_MAGIC);
+        out[footer + 12..footer + 20].copy_from_slice(&(aosp_size as u64).to_be_bytes());
+        out[footer + 20..footer + 28].copy_from_slice(&(vbmeta_offset as u64).to_be_bytes());
+        out[footer + 28..footer + 36].copy_from_slice(&(VBMETA_SIZE as u64).to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn avb_tail_round_trip_is_byte_exact_when_payload_size_is_unchanged() {
+        let src = build_avb_image(4096, 8192);
+        let mut out = src[..4096].to_vec();
+        rebuild_avb_tail(&src, &mut out, 0);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn avb_tail_updates_footer_and_hash_descriptor_image_size() {
+        let src = build_avb_image(4096, 8192);
+        let new_aosp_size = 5000usize;
+        let mut out = vec![0u8; new_aosp_size];
+        rebuild_avb_tail(&src, &mut out, 0);
+
+        let footer = out.len() - size_of::<AvbFooter>();
+        assert_eq!(read_be_u64(&out, footer + 12), Some(new_aosp_size as u64));
+        assert_eq!(read_be_u64(&out, footer + 20), Some(8192));
+        let descriptor = 8192 + size_of::<AvbVBMetaImageHeader>();
+        assert_eq!(
+            read_be_u64(&out, descriptor + size_of::<AvbDescriptor>()),
+            Some(new_aosp_size as u64)
+        );
     }
 
     #[test]
@@ -1728,17 +2091,25 @@ mod tests {
 
         // Size field = AOSP size + 20 (SEANDROIDENFORCE + 0xFFFFFFFF).
         let dhtb_size = u32::from_le_bytes(out[48..52].try_into().unwrap());
-        assert_eq!(dhtb_size, aosp_size + TRAILER_LEN as u32,
-            "DHTB size must cover AOSP payload + 20-byte trailer");
+        assert_eq!(
+            dhtb_size,
+            aosp_size + TRAILER_LEN as u32,
+            "DHTB size must cover AOSP payload + 20-byte trailer"
+        );
 
         // Checksum = SHA-256 over the 20-byte-padded payload.
         let hash_end = DHTB_HDR_SIZE + dhtb_size as usize;
         let expected = Sha256::digest(&out[DHTB_HDR_SIZE..hash_end]);
-        assert_eq!(&out[8..8 + 32], expected.as_slice(),
-            "DHTB SHA-256 checksum must match upstream formula");
+        assert_eq!(
+            &out[8..8 + 32],
+            expected.as_slice(),
+            "DHTB SHA-256 checksum must match upstream formula"
+        );
         // Last 8 bytes of the 40-byte checksum slot must be zero.
-        assert!(out[8 + 32..48].iter().all(|&b| b == 0),
-            "DHTB checksum slot tail must be zero-padded");
+        assert!(
+            out[8 + 32..48].iter().all(|&b| b == 0),
+            "DHTB checksum slot tail must be zero-padded"
+        );
     }
 
     /// Round-trip real vendor images: unpack → repack → re-unpack,
@@ -1825,10 +2196,15 @@ mod tests {
         h.update(&0u32.to_le_bytes()); // recovery_dtbo empty + size
         let expected = h.finalize();
 
-        assert_eq!(&new_id[..SHA_DIGEST_SIZE], expected.as_slice(),
-            "SHA-1 id digest mismatch");
-        assert!(new_id[SHA_DIGEST_SIZE..].iter().all(|&b| b == 0),
-            "SHA-1 tail bytes must be zero-padded");
+        assert_eq!(
+            &new_id[..SHA_DIGEST_SIZE],
+            expected.as_slice(),
+            "SHA-1 id digest mismatch"
+        );
+        assert!(
+            new_id[SHA_DIGEST_SIZE..].iter().all(|&b| b == 0),
+            "SHA-1 tail bytes must be zero-padded"
+        );
     }
 
     #[test]
@@ -1861,8 +2237,7 @@ mod tests {
         h.update(&0u32.to_le_bytes());
         let expected = h.finalize();
 
-        assert_eq!(new_id, expected.as_slice(),
-            "SHA-256 id digest mismatch");
+        assert_eq!(new_id, expected.as_slice(), "SHA-256 id digest mismatch");
     }
 
     /// Byte-for-byte parity against a C++ `magiskboot repack` result.

@@ -21,7 +21,7 @@ macro_rules! match_patterns {
             let b = $buf.get_unchecked(len..);
             if !b.is_empty() && b[0] == b'=' {
                 for c in b.iter() {
-                    if b" \n\0".contains(c) {
+                    if b" \n,\0".contains(c) {
                         break;
                     }
                     len += 1;
@@ -85,6 +85,29 @@ pub fn patch_encryption(buf: &mut [u8]) -> usize {
     }
 
     remove_pattern(buf, match_encryption_pattern)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verity_value_stops_at_comma() {
+        let mut buf = *b"wait,avb=vbmeta_system,logical,first_stage_mount";
+        let size = patch_verity(&mut buf);
+        assert_eq!(
+            &buf[..size],
+            b"wait,logical,first_stage_mount",
+            "flags after the removed value must remain"
+        );
+    }
+
+    #[test]
+    fn encryption_value_stops_at_comma() {
+        let mut buf = *b"wait,fileencryption=aes-256-xts:aes-256-cts:v2,quota";
+        let size = patch_encryption(&mut buf);
+        assert_eq!(&buf[..size], b"wait,quota");
+    }
 }
 
 fn hex2byte(hex: &[u8]) -> Vec<u8> {

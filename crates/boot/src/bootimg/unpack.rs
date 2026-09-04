@@ -4,7 +4,7 @@
 //! Scope: AOSP boot_img v3 / v4 + vendor_boot v3 / v4 + the outer
 //! wrappers the sniffer already handles (direct AOSP / ChromeOS /
 //! DHTB / Tegra Blob). Follow-up commits add legacy v0 / v1 / v2 +
-//! PXA, MTK / Nook / Acclaim / Amonet / Z4 / zImage wrappers.
+//! PXA, MTK / Nook / Acclaim / Amonet / Z4 wrappers.
 //!
 //! The exit-code bitmask returned by [`unpack`] stays
 //! binary-compatible with the upstream C++ build — callers read
@@ -25,9 +25,9 @@ use crate::bootimg::hdr::{
     BootImgHdrV2, BootImgHdrV3, BootImgHdrV4, BootImgHdrVndV3, BootImgHdrVndV4, CHROMEOS_MAGIC,
     DHTB_MAGIC, MTK_MAGIC, MtkHdr, NOOKHD_EB_MAGIC, NOOKHD_ER_MAGIC, NOOKHD_GL_MAGIC,
     NOOKHD_GR_MAGIC, NOOKHD_PRE_HEADER_SZ, NOOKHD_RL_MAGIC, VENDOR_BOOT_MAGIC,
-    VendorRamdiskTableEntryV4, ZIMAGE_MAGIC, ZIMAGE_MAGIC_OFFSET, ZImageHdr, align_to,
-    id_uses_sha1,
+    VendorRamdiskTableEntryV4, ZIMAGE_MAGIC, ZIMAGE_MAGIC_OFFSET, align_to, id_uses_sha1,
 };
+use crate::zimage::ZImage;
 
 /// Directory under `out_dir` that holds per-entry vendor ramdisks for
 /// vendor_boot v4 images with a non-empty ramdisk table.
@@ -802,11 +802,6 @@ fn strip_mtk(slice: &[u8]) -> (&[u8], bool) {
 }
 
 /// Detect if a (post-MTK-strip) kernel slice is an ARM zImage wrapper.
-/// zImage carries the bootstrap decompressor + a compressed piggy
-/// payload. For round-trip parity we only flag it — the raw zImage
-/// bytes already survive unpack → repack unchanged because check_fmt
-/// returns UNKNOWN for the zImage outer shell, so no decompression /
-/// recompression is attempted.
 fn is_zimage(slice: &[u8]) -> bool {
     if slice.len() < ZIMAGE_MAGIC_OFFSET + 4 {
         return false;
@@ -819,8 +814,8 @@ fn is_zimage(slice: &[u8]) -> bool {
     magic == ZIMAGE_MAGIC
 }
 
-/// Dump a kernel or ramdisk section, stripping MTK wrapper header if
-/// present and flagging zImage kernels. Thin wrapper over
+/// Dump a kernel or ramdisk section, stripping MTK and zImage wrappers
+/// when present. Thin wrapper over
 /// [`dump_section`] — only the two section types that carry these
 /// wrappers in the wild call this; other sections (dtb, signature,
 /// bootconfig, second, extra, recovery_dtbo) use `dump_section`
@@ -853,8 +848,27 @@ fn dump_kernel_or_ramdisk(
             BootFlag::MtkRamdisk
         });
     }
-    if is_kernel && is_zimage(inner) {
+    let inner = if is_kernel {
+        if let Some(dtb_offset) = crate::dtb::find_dtb_offset(inner) {
+            dump_section_bytes(&inner[dtb_offset..], out_dir, "kernel_dtb", true)?;
+            &inner[..dtb_offset]
+        } else {
+            inner
+        }
+    } else {
+        inner
+    };
+    if is_kernel
+        && is_zimage(inner)
+        && let Some(zimage) = ZImage::parse(inner)
+    {
         report.flags |= flag_bit(BootFlag::ZImageKernel);
+        let piggy = if zimage.fmt == crate::ffi::FileFormat::GZIP {
+            zimage.piggy
+        } else {
+            &zimage.piggy[..zimage.piggy.len() - size_of::<u32>()]
+        };
+        return dump_section_bytes(piggy, out_dir, name, skip_decompress);
     }
     dump_section_bytes(inner, out_dir, name, skip_decompress)
 }
@@ -898,7 +912,7 @@ fn dump_section_bytes(
     }
     let decoded_path = out_dir.join(name);
     if !skip_decompress {
-        let fmt = crate::ffi::check_fmt(slice);
+        let fmt = crate::format::check_fmt(slice);
         if fmt.is_compressed() {
             let mut out = File::create(&decoded_path)?;
             let mut reader =
@@ -1399,13 +1413,27 @@ mod tests {
     }
 
     #[test]
-    fn unpack_flags_zimage_kernel() {
+    fn unpack_extracts_zimage_piggy() {
         let tmp = tempfile::tempdir().unwrap();
-        // zImage: ZIMAGE_MAGIC at offset 0x24 (36). Anything before
-        // that is free-form bootstrap code bytes.
-        let mut zimage = vec![0xAAu8; 64];
+        const START: u32 = 0x8000;
+        const HEAD: usize = 0x80;
+        const PIGGY_END: usize = 0x90;
+        const TABLE: usize = 0x50;
+        let mut zimage = vec![0u8; 0xa0];
         zimage[ZIMAGE_MAGIC_OFFSET..ZIMAGE_MAGIC_OFFSET + 4]
             .copy_from_slice(&ZIMAGE_MAGIC.to_le_bytes());
+        zimage[0x28..0x2c].copy_from_slice(&START.to_le_bytes());
+        let zimage_end = START + zimage.len() as u32;
+        zimage[0x2c..0x30].copy_from_slice(&zimage_end.to_le_bytes());
+        zimage[0x34..0x38].copy_from_slice(&0x4545_4545u32.to_le_bytes());
+        zimage[0x38..0x3c].copy_from_slice(&(TABLE as u32).to_le_bytes());
+        zimage[TABLE..TABLE + 4].copy_from_slice(&3u32.to_le_bytes());
+        zimage[TABLE + 4..TABLE + 8].copy_from_slice(&0x5a53_4c4bu32.to_le_bytes());
+        zimage[TABLE + 8..TABLE + 12]
+            .copy_from_slice(&(START + PIGGY_END as u32 - 4).to_le_bytes());
+        zimage[HEAD..HEAD + 2].copy_from_slice(b"\x1f\x8b");
+        zimage[HEAD + 2..PIGGY_END].fill(0x5a);
+        let expected_piggy = zimage[HEAD..PIGGY_END].to_vec();
         let ramdisk = b"r".repeat(32);
         let img = assemble_v3_image(&zimage, &ramdisk);
         let img_path = tmp.path().join("zimage.img");
@@ -1414,7 +1442,22 @@ mod tests {
         let out = tmp.path().join("out");
         let report = unpack(&img_path, &out, true, false).expect("unpack");
         assert!(report.has(BootFlag::ZImageKernel));
-        // No MTK wrapper — raw zImage bytes survive unpack verbatim.
+        assert_eq!(std::fs::read(out.join("kernel")).unwrap(), expected_piggy);
+    }
+
+    #[test]
+    fn malformed_zimage_falls_back_to_raw_kernel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut zimage = vec![0xaau8; 64];
+        zimage[ZIMAGE_MAGIC_OFFSET..ZIMAGE_MAGIC_OFFSET + 4]
+            .copy_from_slice(&ZIMAGE_MAGIC.to_le_bytes());
+        let img = assemble_v3_image(&zimage, b"ramdisk");
+        let img_path = tmp.path().join("malformed-zimage.img");
+        std::fs::write(&img_path, &img).unwrap();
+
+        let out = tmp.path().join("out");
+        let report = unpack(&img_path, &out, true, false).expect("unpack");
+        assert!(!report.has(BootFlag::ZImageKernel));
         assert_eq!(std::fs::read(out.join("kernel")).unwrap(), zimage);
     }
 

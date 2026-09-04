@@ -3,7 +3,8 @@
 //          Removed C++ FFI functions (compress_bytes, decompress_bytes).
 //          Compression/decompression logic is kept identical to upstream.
 
-use crate::ffi::{FileFormat, check_fmt};
+use crate::ffi::FileFormat;
+use crate::format::check_fmt;
 use base::{Chunker, FileOrStd, LoggedResult, ReadExt, Utf8CStr, Utf8CString, WriteExt, log_err};
 use bzip2::Compression as BzCompression;
 use bzip2::read::BzDecoder;
@@ -21,9 +22,7 @@ use lzma_rust2::{CheckType, LzmaOptions, LzmaReader, LzmaWriter, XzOptions, XzRe
 use std::cmp::min;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
-use std::io::{BufWriter, Cursor, Read, Write};
-use std::num::NonZeroU64;
-use zopfli::{BlockType, GzipEncoder as ZopFliEncoder, Options as ZopfliOptions};
+use std::io::{Cursor, Read, Write};
 
 pub trait WriteFinish<W: Write>: Write {
     fn finish(self: Box<Self>) -> std::io::Result<W>;
@@ -42,13 +41,6 @@ macro_rules! finish_impl {
 }
 
 finish_impl!(GzEncoder<W>, BzEncoder<W>, XzWriter<W>, LzmaWriter<W>);
-
-impl<W: Write> WriteFinish<W> for BufWriter<ZopFliEncoder<W>> {
-    fn finish(self: Box<Self>) -> std::io::Result<W> {
-        let inner = self.into_inner()?;
-        ZopFliEncoder::finish(inner)
-    }
-}
 
 impl<W: Write> WriteFinish<W> for LZ4FrameEncoder<W> {
     fn finish(self: Box<Self>) -> std::io::Result<W> {
@@ -223,13 +215,13 @@ pub fn get_encoder<'a, W: Write + 'a>(
 ) -> std::io::Result<Box<dyn WriteFinish<W> + 'a>> {
     Ok(match format {
         FileFormat::XZ => {
-            let mut opt = XzOptions::with_preset(9);
+            let mut opt = XzOptions::with_preset(6);
             opt.set_check_sum_type(CheckType::Crc32);
             Box::new(XzWriter::new(w, opt)?)
         }
         FileFormat::LZMA => Box::new(LzmaWriter::new_use_header(
             w,
-            &LzmaOptions::with_preset(9),
+            &LzmaOptions::with_preset(6),
             None,
         )?),
         FileFormat::BZIP2 => Box::new(BzEncoder::new(w, BzCompression::best())),
@@ -246,15 +238,6 @@ pub fn get_encoder<'a, W: Write + 'a>(
         }
         FileFormat::LZ4_LEGACY => Box::new(LZ4BlockEncoder::new(w, false)),
         FileFormat::LZ4_LG => Box::new(LZ4BlockEncoder::new(w, true)),
-        FileFormat::ZOPFLI => {
-            // These options are already better than gzip -9
-            let opt = ZopfliOptions {
-                iteration_count: unsafe { NonZeroU64::new_unchecked(1) },
-                maximum_block_splits: 1,
-                ..Default::default()
-            };
-            Box::new(ZopFliEncoder::new_buffered(opt, BlockType::Dynamic, w)?)
-        }
         FileFormat::GZIP => Box::new(GzEncoder::new(w, GzCompression::best())),
         _ => unreachable!(),
     })
@@ -270,7 +253,7 @@ pub fn get_decoder<'a, R: Read + 'a>(
         FileFormat::BZIP2 => Box::new(BzDecoder::new(r)),
         FileFormat::LZ4 => Box::new(LZ4FrameDecoder::new(r)?),
         FileFormat::LZ4_LG | FileFormat::LZ4_LEGACY => Box::new(LZ4BlockDecoder::new(r)),
-        FileFormat::ZOPFLI | FileFormat::GZIP => Box::new(MultiGzDecoder::new(r)),
+        FileFormat::GZIP => Box::new(MultiGzDecoder::new(r)),
         _ => unreachable!(),
     })
 }

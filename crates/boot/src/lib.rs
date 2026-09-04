@@ -36,6 +36,7 @@ mod payload;
 #[path = "../proto/mod.rs"]
 mod proto;
 mod sign;
+mod zimage;
 
 #[inline(always)]
 pub(crate) fn check_env(env: &str) -> bool {

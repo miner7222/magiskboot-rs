@@ -19,7 +19,7 @@
 //!
 //! Deferred (matches upstream surface area, added as needed):
 //! vendor_boot, legacy v0/v1/v2 + Samsung PXA, MTK / Nook / Acclaim /
-//! Amonet / Z4 / zImage wrappers, SHA id patching for v0–v2, AVB1
+//! Amonet / Z4 wrappers, SHA id patching for v0–v2, AVB1
 //! signature block, DHTB SHA-256 wrapper recompute.
 
 pub mod hdr;
@@ -27,7 +27,8 @@ pub mod repack;
 pub mod split;
 pub mod unpack;
 
+pub use crate::dtb::find_dtb_offset;
 pub use hdr::*;
 pub use repack::{RepackError, repack};
-pub use split::{find_dtb_offset, split_image_dtb};
+pub use split::split_image_dtb;
 pub use unpack::{UnpackError, UnpackReport, unpack};

@@ -392,7 +392,9 @@ mod tests {
 
         let img = BootImage::new(img_path.to_str().unwrap());
         let name = cstr!("/boot");
-        let sig = sign_boot_image(img.payload(), name, None, None).ok().expect("sign");
+        let sig = sign_boot_image(img.payload(), name, None, None)
+            .ok()
+            .expect("sign");
         let tail_off = img.tail_off();
         drop(img);
 
@@ -411,7 +413,10 @@ mod tests {
         drop(fd);
 
         let img2 = BootImage::new(img_path.to_str().unwrap());
-        assert!(img2.is_signed(), "post-sign tail should start with AVB1 magic");
+        assert!(
+            img2.is_signed(),
+            "post-sign tail should start with AVB1 magic"
+        );
         img2.verify(None).ok().expect("verify post-sign image");
     }
 
@@ -425,7 +430,9 @@ mod tests {
         std::fs::write(&img_path, &bytes).unwrap();
 
         let img = BootImage::new(img_path.to_str().unwrap());
-        let sig = sign_boot_image(img.payload(), cstr!("/boot"), None, None).ok().expect("sign");
+        let sig = sign_boot_image(img.payload(), cstr!("/boot"), None, None)
+            .ok()
+            .expect("sign");
         let tail_off = img.tail_off();
         drop(img);
 
@@ -449,7 +456,9 @@ mod tests {
         std::fs::write(&img_path, &raw).unwrap();
 
         let img2 = BootImage::new(img_path.to_str().unwrap());
-        assert!(img2.verify(None).is_err(),
-            "verify must fail after payload tamper");
+        assert!(
+            img2.verify(None).is_err(),
+            "verify must fail after payload tamper"
+        );
     }
 }
