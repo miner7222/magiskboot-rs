@@ -1,19 +1,8 @@
 //! Boot image repack — pure-Rust port of the C++ `repack()` function.
 //!
-//! Scope mirrors `unpack.rs`: AOSP boot_img v3 / v4 + the outer
-//! wrappers 7B already sniffs (direct AOSP, ChromeOS, DHTB, Tegra
-//! Blob). Deferred (follow-up commits, matching `unpack.rs`):
-//!
-//! - vendor_boot v3 / v4
-//! - legacy v0 / v1 / v2 + Samsung PXA
-//! - MTK / Nook / Acclaim / Amonet / Z4 wrappers
-//! - SHA-1 / SHA-256 `id` field patch (v0..v2 only)
-//! - AVB1 signature block (`AVB\0` trailer)
-//! - DHTB wrapper SHA-256 checksum + Blob size recomputation when
-//!   the AOSP payload grows (Blob/DHTB are direct-copied from source
-//!   so size field stays valid as long as the repacked AOSP image
-//!   matches the original size — the pad-to-original-length step
-//!   below guarantees that for compressed-section round-trips)
+//! Scope mirrors `unpack.rs`: AOSP boot v0–v4, Samsung PXA, vendor_boot
+//! v3 / v4, and the wrappers `unpack` recognises. The Z4 wrapper is not
+//! implemented, and ChromeOS images are not re-signed (see `ffi::unpack`).
 //!
 //! Byte-layout rules implemented here:
 //!
@@ -24,12 +13,11 @@
 //!   page boundary *measured from the AOSP header start* — this
 //!   matches C++ `file_align()` = `align_padding(lseek - off.header,
 //!   page_size)`.
-//! - An AVB2 vbmeta block is re-emitted after the rebuilt AOSP image.
-//!   Footer offsets and the first hash descriptor's `image_size` are
-//!   synchronized with the new payload boundary, and the original
-//!   partition length is retained when it still has enough space.
-//! - Output is padded to the source file's length (same as C++
-//!   `write_zero(fd, boot.map.size() - current)`).
+//! - Everything after the last section follows upstream v31.1 (see
+//!   [`finish_tail`]): Samsung / LG trailers, the AVB2 vbmeta blob copied
+//!   verbatim on a 4 KiB boundary, zero padding to the source length, the
+//!   footer's `original_image_size` / `vbmeta_offset`, DHTB / blob size
+//!   fields, and AVB1 re-signing.
 //!
 //! Compression policy:
 //!
@@ -49,12 +37,11 @@ use std::path::Path;
 use bytemuck::Pod;
 
 use crate::bootimg::hdr::{
-    AVB_DESCRIPTOR_TAG_HASH, AVB_FOOTER_MAGIC, AVB_MAGIC, AvbDescriptor, AvbFooter,
-    AvbHashDescriptor, AvbVBMetaImageHeader, BLOB_MAGIC, BOOT_ID_SIZE, BOOT_MAGIC, BootFlag,
-    BootImgHdrPxa, BootImgHdrV0, BootImgHdrV1, BootImgHdrV2, BootImgHdrV3, BootImgHdrV4,
-    BootImgHdrVndV3, BootImgHdrVndV4, CHROMEOS_MAGIC, DHTB_MAGIC, MTK_MAGIC, MtkHdr,
-    SHA_DIGEST_SIZE, SHA256_DIGEST_SIZE, VENDOR_BOOT_MAGIC, VendorRamdiskTableEntryV4,
-    align_padding, align_to, id_uses_sha1,
+    AVB_FOOTER_MAGIC, AVB_MAGIC, AvbFooter, AvbVBMetaImageHeader, BLOB_MAGIC, BOOT_ID_SIZE,
+    BOOT_MAGIC, BootFlag, BootImgHdrPxa, BootImgHdrV0, BootImgHdrV1, BootImgHdrV2, BootImgHdrV3,
+    BootImgHdrV4, BootImgHdrVndV3, BootImgHdrVndV4, DHTB_MAGIC, LG_BUMP_MAGIC, MTK_MAGIC, MtkHdr,
+    SEANDROID_MAGIC, SHA_DIGEST_SIZE, SHA256_DIGEST_SIZE, VENDOR_BOOT_MAGIC,
+    VendorRamdiskTableEntryV4, align_padding, align_to, id_uses_sha1,
 };
 use crate::bootimg::unpack::{VND_RAMDISK_DIR, VND_RAMDISK_TABLE_FILE};
 use crate::ffi::FileFormat;
@@ -78,6 +65,8 @@ pub enum RepackError {
     Truncated { section: &'static str },
     #[error("compression roundtrip failed: {0}")]
     Compress(String),
+    #[error("invalid output layout: {0}")]
+    Layout(&'static str),
 }
 
 /// Rebuild `<out_img>` from `<src_img>` + files in `<work_dir>`
@@ -219,11 +208,8 @@ fn repack_v3(
         &new_hdr,
     );
 
-    // 6. Patch outer wrapper size fields.
-    patch_outer_wrapper(&mut out, out_hdr_off, src_tail_off_rel);
-
-    // 7. Rebuild AVB2 tail and synchronize descriptor sizes.
-    rebuild_avb_tail(src, &mut out, out_hdr_off);
+    // 6. Trailers, AVB2 vbmeta + footer, wrapper fields, AVB1 re-sign.
+    finish_tail(src, hdr_off, src_tail_off_rel, &mut out, out_hdr_off)?;
 
     write_file(out_img, &out)
 }
@@ -309,8 +295,7 @@ fn repack_v4(
         &new_hdr,
     );
 
-    patch_outer_wrapper(&mut out, out_hdr_off, src_tail_off_rel);
-    rebuild_avb_tail(src, &mut out, out_hdr_off);
+    finish_tail(src, hdr_off, src_tail_off_rel, &mut out, out_hdr_off)?;
 
     write_file(out_img, &out)
 }
@@ -441,6 +426,13 @@ fn legacy_offsets(lay: &LegacyRepackLayout) -> (usize, usize, usize, usize, usiz
     )
 }
 
+/// Source offset (relative to the header) where the tail starts: the page
+/// boundary after the last legacy section, as upstream `get_block` computes.
+fn legacy_tail_rel(lay: &LegacyRepackLayout) -> usize {
+    let (.., dtb_off) = legacy_offsets(lay);
+    align_to((dtb_off + lay.dtb_src.len()) as u64, lay.page as u64) as usize
+}
+
 fn repack_v0(
     src: &[u8],
     hdr_off: usize,
@@ -503,7 +495,7 @@ fn repack_v0(
 
     let hdr_slot = &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV0>()];
     hdr_slot.copy_from_slice(bytemuck::bytes_of(&new_hdr));
-    rebuild_avb_tail(src, &mut out, out_hdr_off);
+    finish_tail(src, hdr_off, legacy_tail_rel(&lay), &mut out, out_hdr_off)?;
     write_file(out_img, &out)
 }
 
@@ -571,7 +563,7 @@ fn repack_v1(
 
     let hdr_slot = &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV1>()];
     hdr_slot.copy_from_slice(bytemuck::bytes_of(&new_hdr));
-    rebuild_avb_tail(src, &mut out, out_hdr_off);
+    finish_tail(src, hdr_off, legacy_tail_rel(&lay), &mut out, out_hdr_off)?;
     write_file(out_img, &out)
 }
 
@@ -643,8 +635,7 @@ fn repack_v2(
 
     let hdr_slot = &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrV2>()];
     hdr_slot.copy_from_slice(bytemuck::bytes_of(&new_hdr));
-    let _ = legacy_offsets(&lay);
-    rebuild_avb_tail(src, &mut out, out_hdr_off);
+    finish_tail(src, hdr_off, legacy_tail_rel(&lay), &mut out, out_hdr_off)?;
     write_file(out_img, &out)
 }
 
@@ -710,7 +701,7 @@ fn repack_pxa(
 
     let hdr_slot = &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrPxa>()];
     hdr_slot.copy_from_slice(bytemuck::bytes_of(&new_hdr));
-    rebuild_avb_tail(src, &mut out, out_hdr_off);
+    finish_tail(src, hdr_off, legacy_tail_rel(&lay), &mut out, out_hdr_off)?;
     write_file(out_img, &out)
 }
 
@@ -788,7 +779,8 @@ fn repack_vendor_v3(
     let hdr_slot = &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrVndV3>()];
     hdr_slot.copy_from_slice(bytemuck::bytes_of(&new_hdr));
 
-    rebuild_avb_tail(src, &mut out, out_hdr_off);
+    let src_tail_rel = align_to((dtb_off + src_dtb_size) as u64, page as u64) as usize;
+    finish_tail(src, hdr_off, src_tail_rel, &mut out, out_hdr_off)?;
     write_file(out_img, &out)
 }
 
@@ -956,7 +948,11 @@ fn repack_vendor_v4(
     let hdr_slot = &mut out[out_hdr_off..out_hdr_off + size_of::<BootImgHdrVndV4>()];
     hdr_slot.copy_from_slice(bytemuck::bytes_of(&new_hdr));
 
-    rebuild_avb_tail(src, &mut out, out_hdr_off);
+    let src_tail_rel = align_to(
+        (bootconfig_off + hdr.bootconfig_size as usize) as u64,
+        page as u64,
+    ) as usize;
+    finish_tail(src, hdr_off, src_tail_rel, &mut out, out_hdr_off)?;
     write_file(out_img, &out)
 }
 
@@ -1197,8 +1193,9 @@ fn write_section_payload(
         let before = out.len();
         // Encode via the shared compressor; writes through to `out`.
         {
-            let mut encoder = crate::compress::get_encoder(target_fmt, &mut *out)
-                .map_err(|e| RepackError::Compress(e.to_string()))?;
+            let mut encoder =
+                crate::compress::get_encoder_bcj_detection(target_fmt, &mut *out, &work_bytes)
+                    .map_err(|e| RepackError::Compress(e.to_string()))?;
             encoder
                 .write_all(&work_bytes)
                 .map_err(|e| RepackError::Compress(e.to_string()))?;
@@ -1335,201 +1332,187 @@ fn patch_v4_header(slot: &mut [u8], hdr: &BootImgHdrV4) {
     slot.copy_from_slice(bytemuck::bytes_of(hdr));
 }
 
-/// Patch any outer wrapper that records the AOSP payload size.
-/// DHTB: 512-byte wrapper, size at offset 48 (after magic[8] +
-/// checksum[40]). Blob: 104-byte wrapper, datalen at offset 20.
-/// ChromeOS is opaque — parsing its signed verity metadata is out
-/// of scope so the wrapper stays unmodified (matches C++).
-fn patch_outer_wrapper(out: &mut Vec<u8>, out_hdr_off: usize, src_tail_off_rel: usize) {
-    if out_hdr_off == 0 {
-        return;
-    }
-    // AOSP image size = everything from the start of the AOSP
-    // header through the end of the last section (pre-tail).
-    let aosp_img_size = src_tail_off_rel as u32;
-    if out[..DHTB_MAGIC.len()].starts_with(DHTB_MAGIC) && out.len() >= 52 {
-        // Upstream (`bootimg.cpp::repack`):
-        //   - emit SEANDROID_MAGIC (16) + 0xFFFFFFFF (4) after the
-        //     AOSP payload
-        //   - d_hdr->size = aosp_img_size + 20
-        //   - sha256 = hash(out + sizeof(dhtb_hdr), d_hdr->size)
-        const DHTB_HDR_SIZE: usize = 512;
-        const DHTB_TRAILER_LEN: u32 = 16 + 4;
-        let dhtb_size = aosp_img_size + DHTB_TRAILER_LEN;
-
-        // Emit the SEANDROIDENFORCE + 0xFFFFFFFF trailer. Truncate
-        // first so a caller-preserved tail cannot offset us.
-        out.truncate(out_hdr_off + aosp_img_size as usize);
-        out.extend_from_slice(b"SEANDROIDENFORCE");
-        out.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
-
-        // dhtb_hdr::size lives right after magic[8] + checksum[40] = 48
-        out[48..52].copy_from_slice(&dhtb_size.to_le_bytes());
-
-        // SHA-256 covers AOSP payload + 20-byte trailer.
-        let hash_end = DHTB_HDR_SIZE + dhtb_size as usize;
-        let digest = Sha256::digest(&out[DHTB_HDR_SIZE..hash_end]);
-        // checksum slot is 40 bytes — fill first 32 with the hash,
-        // zero the trailing 8 to match upstream initialisation.
-        out[8..8 + 32].copy_from_slice(&digest);
-        for b in &mut out[8 + 32..48] {
-            *b = 0;
-        }
-        return;
-    }
-    if out[..BLOB_MAGIC.len()].starts_with(BLOB_MAGIC) && out.len() >= 24 {
-        // blob_hdr::datalen lives at offset 20 (after secure_magic[20]).
-        out[20..24].copy_from_slice(&aosp_img_size.to_le_bytes());
-        return;
-    }
-    // ChromeOS + unknown wrappers: leave as-is.
-    let _ = CHROMEOS_MAGIC;
-    let _ = BootFlag::ChromeOs;
-}
-
 fn read_be_u64(buf: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_be_bytes(
         buf.get(offset..offset + 8)?.try_into().ok()?,
     ))
 }
 
-fn patch_avb_hash_descriptor(
-    out: &mut [u8],
-    vbmeta_offset: usize,
-    vbmeta_size: usize,
-    image_size: u64,
-) {
-    let Some(vbmeta_end) = vbmeta_offset.checked_add(vbmeta_size) else {
-        return;
-    };
-    if vbmeta_size < size_of::<AvbVBMetaImageHeader>() || vbmeta_end > out.len() {
-        return;
-    }
+/// Samsung `SignerVer02` block that follows `SEANDROIDENFORCE` in the tail.
+const SIGNER_VER02_MAGIC: &[u8] = b"SignerVer02";
+const SIGNER_VER02_SZ: usize = 512;
+/// DHTB wrapper: magic[8] + checksum[40] + size(u32) + padding → 512 bytes.
+const DHTB_HDR_SZ: usize = 512;
+const DHTB_CHECKSUM_OFF: usize = 8;
+const DHTB_SIZE_OFF: usize = 48;
+/// Tegra blob wrapper: `blob_hdr::size` sits after secure_magic[20],
+/// datalen, signature, magic[16], hdr_version, hdr_size, part_offset,
+/// num_parts, unknown[7], name[4], offset.
+const BLOB_HDR_SZ: usize = 104;
+const BLOB_SIZE_OFF: usize = 96;
+/// avbtool's block size for non-sparse images.
+const AVB_BLOCK_SIZE: usize = 4096;
+/// `AvbVBMetaImageHeader::flags` (big endian u32).
+const VBMETA_FLAGS_OFF: usize = 120;
 
-    let Some(auth_size) =
-        read_be_u64(out, vbmeta_offset + 12).and_then(|v| usize::try_from(v).ok())
-    else {
-        return;
-    };
-    let Some(descriptors_offset) =
-        read_be_u64(out, vbmeta_offset + 96).and_then(|v| usize::try_from(v).ok())
-    else {
-        return;
-    };
-    let Some(descriptors_size) =
-        read_be_u64(out, vbmeta_offset + 104).and_then(|v| usize::try_from(v).ok())
-    else {
-        return;
-    };
-    let Some(descriptors_start) = vbmeta_offset
-        .checked_add(size_of::<AvbVBMetaImageHeader>())
-        .and_then(|v| v.checked_add(auth_size))
-        .and_then(|v| v.checked_add(descriptors_offset))
-    else {
-        return;
-    };
-    let Some(descriptors_end) = descriptors_start.checked_add(descriptors_size) else {
-        return;
-    };
-    if descriptors_end > vbmeta_end {
-        eprintln!("AVB descriptors overflow vbmeta buffer");
-        return;
-    }
-
-    let mut descriptor = descriptors_start;
-    while descriptor < descriptors_end {
-        let remaining = descriptors_end - descriptor;
-        if remaining < size_of::<AvbDescriptor>() {
-            eprintln!("AVB descriptor header overflows descriptor buffer");
-            break;
-        }
-        let Some(tag) = read_be_u64(out, descriptor) else {
-            break;
-        };
-        let Some(following) =
-            read_be_u64(out, descriptor + 8).and_then(|v| usize::try_from(v).ok())
-        else {
-            break;
-        };
-        if following % 8 != 0 {
-            eprintln!("AVB descriptor length is not 8-byte aligned");
-            break;
-        }
-        let Some(next) = descriptor
-            .checked_add(size_of::<AvbDescriptor>())
-            .and_then(|v| v.checked_add(following))
-        else {
-            break;
-        };
-        if next > descriptors_end {
-            eprintln!("AVB descriptor length overflows descriptor buffer");
-            break;
-        }
-
-        if tag == AVB_DESCRIPTOR_TAG_HASH {
-            let min_body = size_of::<AvbHashDescriptor>() - size_of::<AvbDescriptor>();
-            if following < min_body {
-                eprintln!("AVB descriptor is too small to hold a hash descriptor");
-                break;
-            }
-            let image_size_offset = descriptor + size_of::<AvbDescriptor>();
-            out[image_size_offset..image_size_offset + 8]
-                .copy_from_slice(&image_size.to_be_bytes());
-            break;
-        }
-        descriptor = next;
-    }
+fn has_flag(flags: u32, f: BootFlag) -> bool {
+    flags & (1u32 << (f as u32)) != 0
 }
 
-/// Re-emit an AVB2 vbmeta block at the repacked AOSP boundary, preserve the
-/// original partition length, and patch every offset/size that depends on the
-/// rebuilt payload. Invalid footer metadata is ignored, matching upstream's
-/// behavior when no usable AVB footer was discovered during parsing.
-fn rebuild_avb_tail(src: &[u8], out: &mut Vec<u8>, header_offset: usize) {
+/// The source image's AVB2 footer and the vbmeta blob it points to, when both
+/// are well formed. Offsets are absolute in the source file.
+fn source_avb(src: &[u8]) -> Option<(&[u8], &[u8])> {
     let footer_size = size_of::<AvbFooter>();
-    let Some(src_footer_offset) = src.len().checked_sub(footer_size) else {
-        return;
-    };
-    let src_footer = &src[src_footer_offset..];
-    if !src_footer.starts_with(AVB_FOOTER_MAGIC) {
-        return;
+    let footer_off = src.len().checked_sub(footer_size)?;
+    let footer = &src[footer_off..];
+    if !footer.starts_with(AVB_FOOTER_MAGIC) {
+        return None;
+    }
+    let vbmeta_off = read_be_u64(footer, 20).and_then(|v| usize::try_from(v).ok())?;
+    let vbmeta_size = read_be_u64(footer, 28).and_then(|v| usize::try_from(v).ok())?;
+    let vbmeta_end = vbmeta_off.checked_add(vbmeta_size)?;
+    if vbmeta_end > footer_off || vbmeta_size < size_of::<AvbVBMetaImageHeader>() {
+        return None;
+    }
+    let vbmeta = &src[vbmeta_off..vbmeta_end];
+    vbmeta.starts_with(AVB_MAGIC).then_some((footer, vbmeta))
+}
+
+/// Everything upstream v31.1 `repack()` does after the last section, shared by
+/// every header version:
+///
+/// 1. proprietary trailers: `SEANDROIDENFORCE` (+ `0xFFFFFFFF` for DHTB,
+///    + Samsung `SignerVer02` block), or the LG bump magic;
+/// 2. the AVB2 vbmeta blob on a 4 KiB boundary (relative to the header);
+/// 3. zero padding to the source length (skipped for ChromeOS, whose
+///    re-signing this port leaves to the caller, as upstream v31.0 did);
+/// 4. the AVB2 footer: `original_image_size` covers the trailers,
+///    `vbmeta_offset` points at the new blob. Hash descriptors are left alone
+///    (upstream reverted the `image_size` sync in 07390a786);
+/// 5. DHTB / Tegra blob size and checksum fields;
+/// 6. AVB1 re-signing with the bundled verity key when the source tail held a
+///    BootSignature that verified.
+///
+/// `out` must end on the page boundary after the last section.
+fn finish_tail(
+    src: &[u8],
+    src_hdr_off: usize,
+    src_tail_rel: usize,
+    out: &mut Vec<u8>,
+    out_hdr_off: usize,
+) -> Result<(), RepackError> {
+    let (outer_flags, _) = crate::bootimg::unpack::sniff_outer_for_repack(src);
+    let dhtb = has_flag(outer_flags, BootFlag::Dhtb);
+    let blob = has_flag(outer_flags, BootFlag::Blob);
+    let chromeos = has_flag(outer_flags, BootFlag::ChromeOs);
+
+    let src_payload_end = src_hdr_off.saturating_add(src_tail_rel).min(src.len());
+    let src_tail = &src[src_payload_end..];
+    let tail_seandroid = src_tail.starts_with(SEANDROID_MAGIC);
+    let signer_ver02 = tail_seandroid
+        && src_tail.len() >= SEANDROID_MAGIC.len() + SIGNER_VER02_SZ
+        && src_tail[SEANDROID_MAGIC.len()..].starts_with(SIGNER_VER02_MAGIC);
+    let lg_bump = !tail_seandroid && src_tail.starts_with(LG_BUMP_MAGIC);
+    let avb1_signed = !tail_seandroid
+        && !lg_bump
+        && crate::sign::verify_boot_signature(&src[src_hdr_off..src_payload_end], src_tail);
+
+    // 1. Proprietary trailers.
+    let tail_off = out.len();
+    if dhtb || tail_seandroid {
+        out.extend_from_slice(SEANDROID_MAGIC);
+        if dhtb {
+            out.extend_from_slice(&[0xFF; 4]);
+        }
+        if signer_ver02 {
+            let start = SEANDROID_MAGIC.len();
+            out.extend_from_slice(&src_tail[start..start + SIGNER_VER02_SZ]);
+        }
+    } else if lg_bump {
+        out.extend_from_slice(LG_BUMP_MAGIC);
+    }
+    let eof_off = out.len();
+    let aosp_img_size = tail_off - out_hdr_off;
+    let orig_img_size = eof_off - out_hdr_off;
+
+    // 2. AVB2 vbmeta.
+    let avb = source_avb(src);
+    let mut vbmeta_off = None;
+    if let Some((_, vbmeta)) = avb {
+        pad_to(out, out_hdr_off, AVB_BLOCK_SIZE);
+        vbmeta_off = Some(out.len());
+        out.extend_from_slice(vbmeta);
     }
 
-    let Some(src_vbmeta_offset) = read_be_u64(src_footer, 20).and_then(|v| usize::try_from(v).ok())
-    else {
-        return;
-    };
-    let Some(vbmeta_size) = read_be_u64(src_footer, 28).and_then(|v| usize::try_from(v).ok())
-    else {
-        return;
-    };
-    let Some(src_vbmeta_end) = src_vbmeta_offset.checked_add(vbmeta_size) else {
-        return;
-    };
-    if src_vbmeta_end > src_footer_offset
-        || vbmeta_size < size_of::<AvbVBMetaImageHeader>()
-        || !src[src_vbmeta_offset..src_vbmeta_end].starts_with(AVB_MAGIC)
-    {
-        return;
+    // 3. Pad to the source length.
+    if !chromeos && out.len() < src.len() {
+        out.resize(src.len(), 0);
     }
 
-    let Some(aosp_image_size) = out.len().checked_sub(header_offset) else {
-        return;
-    };
-    let vbmeta_offset = align_to(out.len() as u64, 4096) as usize;
-    out.resize(vbmeta_offset, 0);
-    out.extend_from_slice(&src[src_vbmeta_offset..src_vbmeta_end]);
+    // 4. AVB2 footer, kept at the very end; grow the image if the new
+    //    vbmeta would otherwise run into it.
+    if let (Some((footer, _)), Some(vbmeta_off)) = (avb, vbmeta_off) {
+        let footer_size = footer.len();
+        let vbmeta_end = vbmeta_off + avb.map_or(0, |(_, v)| v.len());
+        if out.len() < vbmeta_end + footer_size {
+            out.resize(vbmeta_end + footer_size, 0);
+        }
+        let footer_off = out.len() - footer_size;
+        out[footer_off..].copy_from_slice(footer);
+        out[footer_off + 12..footer_off + 20]
+            .copy_from_slice(&(orig_img_size as u64).to_be_bytes());
+        out[footer_off + 20..footer_off + 28].copy_from_slice(&(vbmeta_off as u64).to_be_bytes());
+        if crate::check_env("PATCHVBMETAFLAG") {
+            out[vbmeta_off + VBMETA_FLAGS_OFF..vbmeta_off + VBMETA_FLAGS_OFF + 4]
+                .copy_from_slice(&3u32.to_be_bytes());
+        }
+    }
 
-    let minimum_size = out.len().saturating_add(footer_size);
-    out.resize(src.len().max(minimum_size), 0);
-    let footer_offset = out.len() - footer_size;
-    out[footer_offset..].copy_from_slice(src_footer);
-    out[footer_offset + 12..footer_offset + 20]
-        .copy_from_slice(&(aosp_image_size as u64).to_be_bytes());
-    out[footer_offset + 20..footer_offset + 28]
-        .copy_from_slice(&(vbmeta_offset as u64).to_be_bytes());
+    // 5. Wrapper size / checksum fields. A wrapper the sniff reported but that
+    //    is not where it is patched would be left with stale fields: refuse.
+    if dhtb && !(out_hdr_off >= DHTB_HDR_SZ && out.starts_with(DHTB_MAGIC)) {
+        return Err(RepackError::Layout(
+            "DHTB wrapper is not at the image start",
+        ));
+    }
+    if blob && !dhtb && !(out_hdr_off >= BLOB_HDR_SZ && out.starts_with(BLOB_MAGIC)) {
+        return Err(RepackError::Layout(
+            "Tegra blob wrapper is not at the image start",
+        ));
+    }
+    if dhtb {
+        out[DHTB_SIZE_OFF..DHTB_SIZE_OFF + 4]
+            .copy_from_slice(&(orig_img_size as u32).to_le_bytes());
+        let digest = Sha256::digest(&out[out_hdr_off..out_hdr_off + orig_img_size]);
+        // Upstream writes SHA256_DIGEST_SIZE bytes into the 40-byte slot and
+        // keeps the remaining source bytes.
+        out[DHTB_CHECKSUM_OFF..DHTB_CHECKSUM_OFF + SHA256_DIGEST_SIZE].copy_from_slice(&digest);
+    } else if blob {
+        out[BLOB_SIZE_OFF..BLOB_SIZE_OFF + 4]
+            .copy_from_slice(&(aosp_img_size as u32).to_le_bytes());
+    }
 
-    patch_avb_hash_descriptor(out, vbmeta_offset, vbmeta_size, aosp_image_size as u64);
+    // 6. AVB1 re-sign over the new payload. Upstream skips silently when
+    //    signing fails and writes over vbmeta when the two collide; both would
+    //    ship a broken image, so this port refuses instead.
+    if avb1_signed {
+        let sig = crate::sign::sign_payload_for_cxx(&out[out_hdr_off..tail_off]);
+        if sig.is_empty() {
+            return Err(RepackError::Layout("failed to re-sign the AVB1 signature"));
+        }
+        let sig_end = tail_off + sig.len();
+        let limit = vbmeta_off.unwrap_or(usize::MAX);
+        if sig_end > limit {
+            return Err(RepackError::Layout(
+                "AVB1 signature would overlap the AVB2 vbmeta block",
+            ));
+        }
+        if out.len() < sig_end {
+            out.resize(sig_end, 0);
+        }
+        out[tail_off..sig_end].copy_from_slice(&sig);
+    }
+    Ok(())
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), RepackError> {
@@ -1550,6 +1533,7 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), RepackError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bootimg::hdr::{AVB_DESCRIPTOR_TAG_HASH, AvbDescriptor};
     use crate::bootimg::hdr::{BOOT_MAGIC, BootImgHdrV3, BootImgHdrV4};
     use crate::bootimg::unpack::unpack;
 
@@ -1575,9 +1559,11 @@ mod tests {
         put_u32(&mut image, TABLE + 4, 0x5a53_4c4b);
         put_u32(&mut image, TABLE + 8, START + PIGGY_END as u32 - 4);
         match fmt {
-            FileFormat::GZIP => image[HEAD..HEAD + 2].copy_from_slice(b"\x1f\x8b"),
+            FileFormat::GZIP => {
+                image[HEAD..HEAD + 10].copy_from_slice(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03")
+            }
             FileFormat::XZ => {
-                image[HEAD..HEAD + 5].copy_from_slice(b"\xfd7zXZ");
+                image[HEAD..HEAD + 12].copy_from_slice(b"\xfd7zXZ\x00\x00\x01\x69\x22\xde\x36");
                 put_u32(&mut image, PIGGY_END - 4, 0x1122_3344);
             }
             _ => panic!("unsupported synthetic format"),
@@ -1750,24 +1736,78 @@ mod tests {
     fn avb_tail_round_trip_is_byte_exact_when_payload_size_is_unchanged() {
         let src = build_avb_image(4096, 8192);
         let mut out = src[..4096].to_vec();
-        rebuild_avb_tail(&src, &mut out, 0);
+        finish_tail(&src, 0, 4096, &mut out, 0).unwrap();
         assert_eq!(out, src);
     }
 
     #[test]
-    fn avb_tail_updates_footer_and_hash_descriptor_image_size() {
+    fn avb_tail_updates_footer_but_not_hash_descriptor() {
         let src = build_avb_image(4096, 8192);
         let new_aosp_size = 5000usize;
         let mut out = vec![0u8; new_aosp_size];
-        rebuild_avb_tail(&src, &mut out, 0);
+        finish_tail(&src, 0, 4096, &mut out, 0).unwrap();
 
         let footer = out.len() - size_of::<AvbFooter>();
         assert_eq!(read_be_u64(&out, footer + 12), Some(new_aosp_size as u64));
         assert_eq!(read_be_u64(&out, footer + 20), Some(8192));
+        // Upstream 07390a786 reverted the hash descriptor image_size sync.
         let descriptor = 8192 + size_of::<AvbVBMetaImageHeader>();
         assert_eq!(
             read_be_u64(&out, descriptor + size_of::<AvbDescriptor>()),
-            Some(new_aosp_size as u64)
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn tail_pads_non_avb_image_to_source_length() {
+        let src = vec![0u8; 16384];
+        let mut out = vec![0x11u8; 4096];
+        finish_tail(&src, 0, 4096, &mut out, 0).unwrap();
+        assert_eq!(out.len(), src.len());
+        assert!(out[4096..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn tail_re_emits_seandroid_signer_ver02_block() {
+        let mut src = vec![0u8; 4096];
+        src.extend_from_slice(SEANDROID_MAGIC);
+        let mut signer = vec![0x5Au8; SIGNER_VER02_SZ];
+        signer[..SIGNER_VER02_MAGIC.len()].copy_from_slice(SIGNER_VER02_MAGIC);
+        src.extend_from_slice(&signer);
+        src.resize(12288, 0);
+
+        // New payload is one page longer than the source.
+        let mut out = vec![0u8; 8192];
+        finish_tail(&src, 0, 4096, &mut out, 0).unwrap();
+        assert_eq!(&out[8192..8192 + 16], SEANDROID_MAGIC);
+        assert_eq!(&out[8192 + 16..8192 + 16 + SIGNER_VER02_SZ], &signer[..]);
+        assert_eq!(out.len(), src.len());
+    }
+
+    #[test]
+    fn tail_re_emits_full_lg_bump_magic() {
+        let mut src = vec![0u8; 4096];
+        src.extend_from_slice(LG_BUMP_MAGIC);
+        src.resize(8192, 0);
+        let mut out = vec![0u8; 4096];
+        finish_tail(&src, 0, 4096, &mut out, 0).unwrap();
+        assert_eq!(LG_BUMP_MAGIC.len(), 16);
+        assert_eq!(&out[4096..4112], LG_BUMP_MAGIC);
+    }
+
+    #[test]
+    fn tail_patches_blob_size_field_not_datalen() {
+        let mut src = vec![0u8; BLOB_HDR_SZ];
+        src[..BLOB_MAGIC.len()].copy_from_slice(BLOB_MAGIC);
+        src[20..24].copy_from_slice(&0xAABB_CCDDu32.to_le_bytes());
+        src.extend_from_slice(&[0u8; 4096]);
+        let mut out = src[..BLOB_HDR_SZ].to_vec();
+        out.extend_from_slice(&[0u8; 8192]);
+        finish_tail(&src, BLOB_HDR_SZ, 4096, &mut out, BLOB_HDR_SZ).unwrap();
+        assert_eq!(&out[20..24], &0xAABB_CCDDu32.to_le_bytes());
+        assert_eq!(
+            &out[BLOB_SIZE_OFF..BLOB_SIZE_OFF + 4],
+            &8192u32.to_le_bytes()
         );
     }
 

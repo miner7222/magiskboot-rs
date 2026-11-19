@@ -17,7 +17,7 @@ use crate::compat::libc_compat::{
     S_IFBLK, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP,
     S_IWOTH, S_IWUSR, S_IXGRP, S_IXOTH, S_IXUSR, dev_t, gid_t, makedev, mknod, mode_t, uid_t,
 };
-use crate::compress::{get_decoder, get_encoder};
+use crate::compress::{get_decoder, get_encoder_bcj_detection};
 use crate::ffi::FileFormat;
 use crate::patch::{patch_encryption, patch_verity};
 use base::{
@@ -689,7 +689,7 @@ impl CpioEntry {
             return false;
         }
         let Ok(data) = || -> std::io::Result<Vec<u8>> {
-            let mut encoder = get_encoder(FileFormat::XZ, Vec::new())?;
+            let mut encoder = get_encoder_bcj_detection(FileFormat::XZ, Vec::new(), &self.data)?;
             encoder.write_all(&self.data)?;
             encoder.finish()
         }() else {

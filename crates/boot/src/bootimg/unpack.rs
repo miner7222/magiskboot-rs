@@ -915,10 +915,17 @@ fn dump_section_bytes(
         let fmt = crate::format::check_fmt(slice);
         if fmt.is_compressed() {
             let mut out = File::create(&decoded_path)?;
-            let mut reader =
-                crate::compress::get_decoder(fmt, Box::new(std::io::Cursor::new(slice)))
-                    .map_err(|e| UnpackError::Io(io::Error::other(format!("{e}"))))?;
-            std::io::copy(&mut reader, &mut out)?;
+            let result = crate::compress::get_decoder(fmt, Box::new(std::io::Cursor::new(slice)))
+                .and_then(|mut reader| std::io::copy(&mut reader, &mut out));
+            if let Err(e) = result {
+                // Upstream 6d391dd5b: never leave a truncated component behind
+                // for repack to pick up.
+                drop(out);
+                let _ = std::fs::remove_file(&decoded_path);
+                return Err(UnpackError::Io(io::Error::other(format!(
+                    "failed to decompress {name} ({fmt}): {e}"
+                ))));
+            }
             return Ok(());
         }
     }
@@ -1431,8 +1438,8 @@ mod tests {
         zimage[TABLE + 4..TABLE + 8].copy_from_slice(&0x5a53_4c4bu32.to_le_bytes());
         zimage[TABLE + 8..TABLE + 12]
             .copy_from_slice(&(START + PIGGY_END as u32 - 4).to_le_bytes());
-        zimage[HEAD..HEAD + 2].copy_from_slice(b"\x1f\x8b");
-        zimage[HEAD + 2..PIGGY_END].fill(0x5a);
+        zimage[HEAD..HEAD + 10].copy_from_slice(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03");
+        zimage[HEAD + 10..PIGGY_END].fill(0x5a);
         let expected_piggy = zimage[HEAD..PIGGY_END].to_vec();
         let ramdisk = b"r".repeat(32);
         let img = assemble_v3_image(&zimage, &ramdisk);

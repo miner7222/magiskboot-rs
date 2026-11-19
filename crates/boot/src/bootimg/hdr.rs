@@ -72,7 +72,8 @@ pub const DHTB_MAGIC: &[u8] = b"DHTB\x01\x00\x00\x00";
 /// Samsung secure-signed blob magic.
 pub const SEANDROID_MAGIC: &[u8] = b"SEANDROIDENFORCE";
 /// LG / Bump magic.
-pub const LG_BUMP_MAGIC: &[u8] = b"\x41\xa9\xe4\x67\x74\x4d\x1d\x1b";
+pub const LG_BUMP_MAGIC: &[u8] =
+    b"\x41\xa9\xe4\x67\x74\x4d\x1d\x1b\xa4\x29\xf2\xec\xea\x65\x52\x79";
 /// Nook HD+ wrapper magic (at offset 0x4000).
 pub const NOOKHD_RL_MAGIC: &[u8] = b"Red Loader";
 pub const NOOKHD_GL_MAGIC: &[u8] = b"Green Loader";

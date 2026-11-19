@@ -36,9 +36,16 @@ pub fn split_image_dtb(image_path: &Path, out_dir: &Path, skip_decomp: bool) -> 
     let head = &buf[..dtb_off];
     let fmt = check_fmt(head);
     if !skip_decomp && fmt.is_compressed() {
+        // Upstream 6d391dd5b: a failed decode must not leave a truncated
+        // `kernel` behind for a later repack to pick up.
         let mut out = File::create(&kernel_path)?;
-        let mut reader = crate::compress::get_decoder(fmt, std::io::Cursor::new(head))?;
-        std::io::copy(&mut reader, &mut out)?;
+        let res = crate::compress::get_decoder(fmt, std::io::Cursor::new(head))
+            .and_then(|mut reader| std::io::copy(&mut reader, &mut out));
+        if let Err(e) = res {
+            drop(out);
+            let _ = std::fs::remove_file(&kernel_path);
+            return Err(e);
+        }
     } else {
         File::create(&kernel_path)?.write_all(head)?;
     }
@@ -118,6 +125,20 @@ mod tests {
         let d = std::fs::read(out.join("kernel_dtb")).unwrap();
         assert_eq!(k.len(), prefix_len);
         assert_eq!(d.len(), buf.len() - prefix_len);
+    }
+
+    #[test]
+    fn split_removes_partial_kernel_on_decode_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Valid gzip header followed by garbage deflate data.
+        let mut buf = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03".to_vec();
+        buf.extend_from_slice(&[0xFFu8; 64]);
+        buf.extend_from_slice(&fake_dtb(0x100, b""));
+        let img = tmp.path().join("kernel.img");
+        std::fs::write(&img, &buf).unwrap();
+        let out = tmp.path().join("out");
+        assert!(split_image_dtb(&img, &out, false).is_err());
+        assert!(!out.join("kernel").exists());
     }
 
     #[test]

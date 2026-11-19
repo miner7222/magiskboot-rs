@@ -4,7 +4,7 @@
 //          Compression/decompression logic is kept identical to upstream.
 
 use crate::ffi::FileFormat;
-use crate::format::check_fmt;
+use crate::format::{check_fmt, detect_bcj_filter};
 use base::{Chunker, FileOrStd, LoggedResult, ReadExt, Utf8CStr, Utf8CString, WriteExt, log_err};
 use bzip2::Compression as BzCompression;
 use bzip2::read::BzDecoder;
@@ -243,6 +243,33 @@ pub fn get_encoder<'a, W: Write + 'a>(
     })
 }
 
+/// Environment switch for the XZ BCJ pre-filter (port deviation, see below).
+pub(crate) const XZ_BCJ_ENV: &str = "XZBCJ";
+
+/// Upstream v31.1 (`da320823a`, `70bf88c38`) always prepends an
+/// architecture-specific BCJ pre-filter when XZ-compressing code. Upstream
+/// ships magiskboot together with a magiskinit whose xz decoder gained BCJ
+/// support in the same release; magiskinit v31.0 and older cannot decode BCJ
+/// streams. This port is paired with arbitrary Magisk releases, so the filter
+/// is opt-in: set `XZBCJ=true` only when the consumer decodes BCJ (Magisk
+/// v31.1+ magiskinit, or a kernel built with the matching XZ_DEC_* filter).
+pub fn get_encoder_bcj_detection<'a, W: Write + 'a>(
+    format: FileFormat,
+    w: W,
+    in_bytes: &[u8],
+) -> std::io::Result<Box<dyn WriteFinish<W> + 'a>> {
+    if format == FileFormat::XZ && crate::check_env(XZ_BCJ_ENV) {
+        let mut opt = XzOptions::with_preset(6);
+        opt.set_check_sum_type(CheckType::Crc32);
+        if let Some(filter) = detect_bcj_filter(in_bytes) {
+            opt.prepend_pre_filter(filter, 0);
+        }
+        Ok(Box::new(XzWriter::new(w, opt)?))
+    } else {
+        get_encoder(format, w)
+    }
+}
+
 pub fn get_decoder<'a, R: Read + 'a>(
     format: FileFormat,
     r: R,
@@ -349,8 +376,13 @@ pub(crate) fn compress_cmd(
         FileOrStd::File(File::create(outfile.as_str())?)
     };
 
-    let mut encoder = get_encoder(method, output.as_file())?;
-    std::io::copy(&mut input.as_file(), encoder.as_mut())?;
+    let mut buf = [0u8; 4096];
+    let len = input.as_file().read(&mut buf)?;
+    let buf = &buf[..len];
+
+    let mut encoder = get_encoder_bcj_detection(method, output.as_file(), buf)?;
+    let mut reader = Cursor::new(buf).chain(input.as_file());
+    std::io::copy(&mut reader, encoder.as_mut())?;
     encoder.finish()?;
 
     if rm_in {

@@ -129,17 +129,29 @@ impl<'a> ZImage<'a> {
         let table_magic = read_u32(zimg, 0x34);
         let table_offset = read_u32(zimg, 0x38);
 
-        // Step 2: Locate the start of compressed piggy payload by scanning forward from 0x28
+        // Step 2: Locate the start of compressed piggy payload by scanning forward from 0x28.
+        // Compressed payload sections (.piggydata) are 4-byte aligned in Linux kernel linker scripts.
         let mut piggy_ptr = None;
-        for curr in 0x28..zimg.len() {
-            if check_fmt(&zimg[curr..]) != FileFormat::UNKNOWN {
-                piggy_ptr = Some(curr);
+        for curr in (0x28..zimg.len()).step_by(4) {
+            let fmt = check_fmt(&zimg[curr..]);
+            if fmt.is_compressed() {
+                piggy_ptr = Some((curr, fmt));
                 break;
             }
         }
+        // Fallback to unaligned scan if 4-byte aligned scan yields no candidate
+        if piggy_ptr.is_none() {
+            for curr in 0x28..zimg.len() {
+                let fmt = check_fmt(&zimg[curr..]);
+                if fmt.is_compressed() {
+                    piggy_ptr = Some((curr, fmt));
+                    break;
+                }
+            }
+        }
 
-        let piggy_off = match piggy_ptr {
-            Some(off) => off,
+        let (piggy_off, fmt) = match piggy_ptr {
+            Some((off, fmt)) => (off, fmt),
             None => {
                 eprintln!("! Could not find zImage piggy, keeping raw kernel");
                 return None;
@@ -147,7 +159,6 @@ impl<'a> ZImage<'a> {
         };
 
         let head = &zimg[..piggy_off];
-        let fmt = check_fmt(&zimg[piggy_off..]);
 
         // Step 3: Scan for the LC0 position table (arch/arm/boot/compressed/head.S)
         // LC0 contains position-independent runtime pointers: _start, _got_start, _got_end, _edata, etc.
@@ -551,9 +562,11 @@ mod tests {
         write_u32(&mut image, ADD, 0xe08f_1000);
 
         match fmt {
-            FileFormat::GZIP => image[HEAD_LEN..HEAD_LEN + 2].copy_from_slice(b"\x1f\x8b"),
+            FileFormat::GZIP => image[HEAD_LEN..HEAD_LEN + 10]
+                .copy_from_slice(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03"),
             FileFormat::XZ => {
-                image[HEAD_LEN..HEAD_LEN + 5].copy_from_slice(b"\xfd7zXZ");
+                image[HEAD_LEN..HEAD_LEN + 12]
+                    .copy_from_slice(b"\xfd7zXZ\x00\x00\x01\x69\x22\xde\x36");
                 write_u32(&mut image, PIGGY_END - 4, 0x1234_5678);
             }
             _ => panic!("unsupported synthetic format"),
@@ -660,7 +673,8 @@ mod tests {
 
         let mut no_piggy_end = vec![0u8; HEAD_LEN + PIGGY_LEN];
         write_u32(&mut no_piggy_end, 0x24, 0x016f_2818);
-        no_piggy_end[HEAD_LEN..HEAD_LEN + 2].copy_from_slice(b"\x1f\x8b");
+        no_piggy_end[HEAD_LEN..HEAD_LEN + 10]
+            .copy_from_slice(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03");
         assert!(ZImage::parse(&no_piggy_end).is_none());
     }
 }

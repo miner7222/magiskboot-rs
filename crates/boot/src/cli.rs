@@ -30,7 +30,7 @@ enum Action {
     Unpack(Unpack),
     Repack(Repack),
     Verify(Verify),
-    Sign(Sign),
+    SignAvb1(SignAvb1),
     Extract(Extract),
     HexPatch(HexPatch),
     Cpio(Cpio),
@@ -74,8 +74,8 @@ struct Verify {
 }
 
 #[derive(FromArgs)]
-#[argh(subcommand, name = "sign")]
-struct Sign {
+#[argh(subcommand, name = "sign-avb1")]
+struct SignAvb1 {
     #[argh(positional)]
     img: Utf8CString,
     #[argh(positional)]
@@ -220,7 +220,7 @@ Supported actions:
   verify <bootimg> [x509.pem]
     Check whether the boot image is signed with AVB 1.0 signature.
 
-  sign <bootimg> [name] [x509.pem pk8]
+  sign-avb1 <bootimg> [name] [x509.pem pk8]
     Sign <bootimg> with AVB 1.0 signature.
 
   extract <payload.bin> [partition] [outfile]
@@ -247,6 +247,8 @@ Supported actions:
   compress[=format] <infile> [outfile]
     Compress <infile> with [format] to [outfile].
     Supported formats: {1}
+    If env variable XZBCJ is set to true, xz output of executables and
+    kernels gets a BCJ pre-filter (decodable by Magisk v31.1+ only).
 
   decompress <infile> [outfile]
     Detect format and decompress <infile> to [outfile].
@@ -325,11 +327,13 @@ pub fn boot_main(cmds: CmdArgs) -> LoggedResult<i32> {
             img,
             out,
         }) => {
-            repack(
+            if !repack(
                 img.as_str(),
                 out.as_ref().map(|s| s.as_str()).unwrap_or("new-boot.img"),
                 no_compress,
-            );
+            ) {
+                return log_err!();
+            }
         }
         Action::Verify(Verify { img, cert }) => {
             let bi = crate::ffi::BootImage::new(img.as_str());
@@ -339,7 +343,7 @@ pub fn boot_main(cmds: CmdArgs) -> LoggedResult<i32> {
             }
             bi.verify(cert.as_deref())?;
         }
-        Action::Sign(Sign {
+        Action::SignAvb1(SignAvb1 {
             img,
             name,
             cert,

@@ -84,23 +84,41 @@ pub fn cleanup() {
     let _ = std::fs::remove_dir_all("vendor_ramdisk");
 }
 
-/// Unpack a boot image into the current working directory.
-/// Returns the upstream-compatible flag bitmask on success, or `-1`
-/// on failure — callers pass this to `std::process::exit`.
+/// `unpack` exit codes, matching upstream `bootimg.cpp`.
+pub const UNPACK_OK: i32 = 0;
+pub const UNPACK_ERROR: i32 = 1;
+/// ChromeOS image: the repacked image must be re-signed externally.
+/// Upstream v31.1 dropped this code because its repack re-signs ChromeOS
+/// images itself; this port does not, so it keeps the v31.0 contract.
+pub const UNPACK_CHROMEOS: i32 = 2;
+pub const UNPACK_VENDOR: i32 = 3;
+
+/// Unpack a boot image into the current working directory and return the
+/// upstream exit code: 0 valid, 1 error, 2 chromeos, 3 vendor_boot.
 pub fn unpack(image: &str, skip_decomp: bool, hdr: bool) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     match crate::bootimg::unpack(std::path::Path::new(image), &cwd, skip_decomp, hdr) {
-        Ok(report) => report.flags as i32,
+        Ok(report) => unpack_exit_code(&report),
         Err(e) => {
             eprintln!("! unpack failed: {e}");
-            -1
+            UNPACK_ERROR
         }
     }
 }
 
+fn unpack_exit_code(report: &crate::bootimg::UnpackReport) -> i32 {
+    if report.has(crate::bootimg::hdr::BootFlag::ChromeOs) {
+        UNPACK_CHROMEOS
+    } else if report.is_vendor {
+        UNPACK_VENDOR
+    } else {
+        UNPACK_OK
+    }
+}
+
 /// Repack a boot image using sections from the current working
-/// directory.
-pub fn repack(src_img: &str, out_img: &str, skip_comp: bool) {
+/// directory. Returns `false` (exit 1 in the CLI) on failure.
+pub fn repack(src_img: &str, out_img: &str, skip_comp: bool) -> bool {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     if let Err(e) = crate::bootimg::repack(
         std::path::Path::new(src_img),
@@ -109,7 +127,9 @@ pub fn repack(src_img: &str, out_img: &str, skip_comp: bool) {
         skip_comp,
     ) {
         eprintln!("! repack failed: {e}");
+        return false;
     }
+    true
 }
 
 /// Split an appended-DTB kernel image into `./kernel` + `./kernel_dtb`.

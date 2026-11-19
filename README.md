@@ -24,7 +24,7 @@ Rust stable only. The binary is written to `target/release/magiskboot`
 magiskboot unpack [-n] [-h] <bootimg>
 magiskboot repack [-n] <origbootimg> [outbootimg]
 magiskboot verify <bootimg> [x509.pem]
-magiskboot sign <bootimg> [name] [x509.pem pk8]
+magiskboot sign-avb1 <bootimg> [name] [x509.pem pk8]
 magiskboot extract <payload.bin> [partition] [outfile]
 magiskboot hexpatch <file> <hexpattern1> <hexpattern2>
 magiskboot cpio <incpio> [commands...]
@@ -37,6 +37,12 @@ magiskboot decompress <infile> [outfile]
 ```
 
 Compression formats: `gzip`, `xz`, `lzma`, `bzip2`, `lz4`, `lz4_legacy`, `lz4_lg`.
+
+`unpack` exits with 0 (boot image), 1 (error), 2 (ChromeOS) or 3 (vendor_boot);
+`repack` exits with 1 on failure.
+
+Environment switches: `KEEPVERITY`, `KEEPFORCEENCRYPT` (cpio patch), `PATCHVBMETAFLAG`
+(repack sets the vbmeta disable flags), `XZBCJ` (see below). Each takes `true`.
 
 ## Library usage
 
@@ -63,15 +69,19 @@ stays in control of its own error handling.
 - AOSP boot image header v0–v4, and the Samsung PXA variant
 - `vendor_boot` header v3 and v4, including the multi-ramdisk table and bootconfig
 - Whole-image wrappers: AOSP, ChromeOS, DHTB (size and SHA-256 recomputed on repack),
-  Tegra Blob
+  Tegra Blob (size recomputed on repack)
+- Tail trailers re-emitted on repack: Samsung `SEANDROIDENFORCE` with its `SignerVer02`
+  block, and the LG bump magic
 - Pre-header wrappers preserved byte-for-byte: NookHD, Acclaim, Amonet
 - Section wrappers: MTK kernel/ramdisk headers with the size field patched on repack,
   and ARM32 zImage — parsed, so a resized piggy is relocated rather than rejected
 - The v0/v1/v2/PXA `id` field recomputed with whichever hash the source used, detected
   from its trailer
-- AVB1 `sign` / `verify`, writing a DER BootSignature tail with the bundled verity
-  keypair or a supplied `x509.pem` + `pk8`
-- AVB2 footers and vbmeta tails preserved through unpack/repack
+- AVB1 `sign-avb1` / `verify` (RSA, ECDSA P-256/P-384/P-521 with DER signatures),
+  writing a DER BootSignature tail with the bundled verity keypair or a supplied
+  `x509.pem` + `pk8`; repack re-signs an image whose source tail verified
+- AVB2 footers and vbmeta tails preserved through unpack/repack; vbmeta is copied
+  verbatim and only the footer's `original_image_size` / `vbmeta_offset` change
 
 Not implemented: the Z4 (lokiloader) wrapper.
 
@@ -95,6 +105,11 @@ reference. Nothing in the build graph reads from it.
 - The boot image pipeline is Rust; upstream keeps it in C++.
 - The `extern "C"` shims upstream used to drive the Rust codecs from C++ are kept in
   history for reference but are not compiled.
+- XZ BCJ pre-filters (upstream v31.1) are opt-in through `XZBCJ=true`. Upstream ships
+  magiskboot together with a magiskinit that decodes BCJ; magiskinit v31.0 and older
+  cannot, and this binary is paired with arbitrary Magisk releases.
+- ChromeOS images are not re-signed on repack (upstream v31.1 added `sign-chromeos`);
+  `unpack` keeps returning 2 so the caller can sign them externally.
 
 ## Testing
 
