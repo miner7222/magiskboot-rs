@@ -32,9 +32,6 @@ use crate::zimage::ZImage;
 /// Directory under `out_dir` that holds per-entry vendor ramdisks for
 /// vendor_boot v4 images with a non-empty ramdisk table.
 pub const VND_RAMDISK_DIR: &str = "vendor_ramdisk";
-/// Filename the vendor ramdisk table is dumped to so repack can
-/// reconstruct it bit-for-bit (entry ordering + board_id payloads).
-pub const VND_RAMDISK_TABLE_FILE: &str = "vendor_ramdisk_table";
 
 /// Exit-code bit for a specific [`BootFlag`] — mirrors the C++
 /// `std::bitset<BOOT_FLAGS_MAX>` layout + the CLI's `exit(flags.to_ulong())`.
@@ -715,9 +712,6 @@ fn unpack_vendor_v4_sections(
             });
         }
         let table_bytes = &payload[table_off_usize..table_end];
-        // Store the raw table bytes so repack can reproduce board_id /
-        // ramdisk_type exactly without re-encoding.
-        std::fs::write(out_dir.join(VND_RAMDISK_TABLE_FILE), table_bytes)?;
 
         std::fs::create_dir_all(out_dir.join(VND_RAMDISK_DIR))?;
         for idx in 0..table_entry_num as usize {

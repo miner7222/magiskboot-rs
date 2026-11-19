@@ -43,7 +43,7 @@ use crate::bootimg::hdr::{
     SEANDROID_MAGIC, SHA_DIGEST_SIZE, SHA256_DIGEST_SIZE, VENDOR_BOOT_MAGIC,
     VendorRamdiskTableEntryV4, align_padding, align_to, id_uses_sha1,
 };
-use crate::bootimg::unpack::{VND_RAMDISK_DIR, VND_RAMDISK_TABLE_FILE};
+use crate::bootimg::unpack::VND_RAMDISK_DIR;
 use crate::ffi::FileFormat;
 use crate::format::check_fmt;
 use crate::zimage::ZImage;
@@ -720,9 +720,8 @@ fn repack_pxa(
 // vendor_boot header start — matches the C++ `file_align()` macro.
 // Multi-ramdisk v4 images pull per-entry cpios from
 // `<work_dir>/vendor_ramdisk/<name>.cpio` and rewrite the table
-// offsets/sizes accordingly. The `vendor_ramdisk_table` dump file
-// carries board_id + type fields verbatim so they round-trip
-// unchanged.
+// offsets/sizes accordingly; every other table field (board_id, type)
+// is copied from the source image, as upstream does.
 // ---------------------------------------------------------------------------
 
 fn repack_vendor_v3(
@@ -842,16 +841,9 @@ fn repack_vendor_v4(
         }
         let src_table_bytes = &src[src_table_start..src_table_end];
 
+        // Like upstream, the table always comes from the source image; only
+        // each entry's offset / size is rewritten below.
         let mut new_table_bytes = src_table_bytes.to_vec();
-        // If the work dir has a persisted table file, prefer it
-        // (carries user edits to board_id / ramdisk_type).
-        let table_file = work_dir.join(VND_RAMDISK_TABLE_FILE);
-        if table_file.exists() {
-            let bytes = std::fs::read(&table_file)?;
-            if bytes.len() == src_table_size {
-                new_table_bytes = bytes;
-            }
-        }
 
         let section_start_in_out = out.len();
         let mut cursor_in_section: u32 = 0;
