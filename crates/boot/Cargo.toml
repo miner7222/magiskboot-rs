@@ -18,18 +18,17 @@ base = { path = "../base" }
 flate2 = { version = "1", features = ["zlib-rs"] }
 bzip2 = "0.6"
 lz4 = "1"
-lzma-rust2 = "0.16"
-# Crypto
-sha1 = "0.10"
-sha2 = "0.10"
-digest = { version = "0.10", features = ["std"] }
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-p384 = { version = "0.13", features = ["ecdsa"] }
-# p521 disabled: 0.13 lacks pkcs8/spki TryFrom support needed for signing/verifying
-# p521 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-rsa = { version = "0.9", features = ["sha2"] }
-x509-cert = "0.2"
-der = { version = "0.7", features = ["derive", "pem"] }
+lzma-rust2 = "0.25"
+# Crypto (RustCrypto crates are tied together; versions follow Magisk v31.0)
+sha1 = "0.11"
+sha2 = "0.11"
+digest = "0.11"
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+p521 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+rsa = { version = "0.10", features = ["pkcs1v15"] }
+x509-cert = "0.3"
+der = { version = "0.8", features = ["derive", "pem"] }
 # Parsing
 fdt = "0.1.5"
 size = "0.5.0"
