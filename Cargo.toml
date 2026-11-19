@@ -3,7 +3,7 @@ members = ["crates/base", "crates/boot", "crates/derive"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 # Ported from Magisk (https://github.com/topjohnwu/Magisk), GPL-3.0-or-later.
 license = "GPL-3.0-or-later"
