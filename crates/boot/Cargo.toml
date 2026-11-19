@@ -9,7 +9,7 @@ name = "magiskboot"
 path = "src/main.rs"
 
 [build-dependencies]
-pb-rs = "0.10"
+pb-rs = { version = "0.10", default-features = false }
 
 [dependencies]
 base = { path = "../base" }
